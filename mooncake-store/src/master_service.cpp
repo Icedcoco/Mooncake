@@ -637,8 +637,26 @@ void MasterService::ClearInvalidHandles(
                     promotion_in_flight_.fetch_sub(1,
                                                    std::memory_order_relaxed);
                 }
+                if (enable_ha_ && oplog_store_) {
+                    AppendOrPersistOrEnqueue(
+                        "ClearInvalidHandles(last replica REMOVE)",
+                        OpType::REMOVE, it->first, {},
+                        PendingMutationKind::CLEAR_ALL_REPLICAS);
+                }
                 it = shard->metadata.erase(it);
             } else {
+                // Still has valid replicas (disk/local), write PUT_END
+                if (enable_ha_ && oplog_store_ &&
+                    it->second.HasReplica([](const Replica& r) {
+                        return !r.is_memory_replica() ||
+                               !r.has_invalid_mem_handle();
+                    })) {
+                    AppendOrPersistOrEnqueue(
+                        "ClearInvalidHandles(has remaining replicas)",
+                        OpType::PUT_END, it->first,
+                        SerializeMetadataForOpLogWithoutMemReplicas(it->second),
+                        PendingMutationKind::EVICT_MEM_REPLICAS);
+                }
                 ++it;
             }
         }
@@ -1006,6 +1024,11 @@ auto MasterService::BatchReplicaClear(
                 });
 
             // Erase the entire metadata (all replicas will be deallocated)
+            if (enable_ha_ && oplog_store_) {
+                AppendOrPersistOrEnqueue("BatchReplicaClear(clear_all)",
+                                         OpType::REMOVE, key, {},
+                                         PendingMutationKind::CLEAR_ALL_REPLICAS);
+            }
             accessor.Erase();
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
@@ -1045,6 +1068,29 @@ auto MasterService::BatchReplicaClear(
                     << " has no replica on segment_name=" << segment_name
                     << ", skipping";
                 continue;
+            }
+
+            // Determine OpLog type based on remaining replicas after segment clear
+            if (enable_ha_ && oplog_store_) {
+                // Check if this will leave valid replicas
+                bool will_have_valid_replicas = metadata.HasReplica(
+                    [&match_replica_on_segment](const Replica& r) {
+                        return !match_replica_on_segment(r) &&
+                               (!r.is_memory_replica() ||
+                                !r.has_invalid_mem_handle());
+                    });
+                if (!will_have_valid_replicas) {
+                    AppendOrPersistOrEnqueue(
+                        "BatchReplicaClear(segment, last replica)",
+                        OpType::REMOVE, key, {},
+                        PendingMutationKind::CLEAR_ALL_REPLICAS);
+                } else {
+                    AppendOrPersistOrEnqueue(
+                        "BatchReplicaClear(segment, has remaining)",
+                        OpType::PUT_END, key,
+                        SerializeMetadataForOpLogWithoutMemReplicas(metadata),
+                        PendingMutationKind::EVICT_MEM_REPLICAS);
+                }
             }
 
             metadata.EraseReplicas(match_replica_on_segment);
@@ -1376,6 +1422,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
             shard->processing_keys.erase(key);
+            if (enable_ha_ && it != shard->metadata.end()) {
+                AppendOrPersistOrEnqueue("PutStart(overwrite REMOVE)",
+                                         OpType::REMOVE, key, {},
+                                         PendingMutationKind::CLEAR_ALL_REPLICAS);
+            }
             shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -1457,6 +1508,12 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+
+    if (enable_ha_ && oplog_store_) {
+        std::string payload = SerializeMetadataForOpLog(metadata);
+        AppendOpLogAndNotify(OpType::PUT_END, key, payload);
+    }
+
     return {};
 }
 
@@ -1541,6 +1598,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         MasterMetricManager::instance().dec_mem_cache_nums();
     } else if (replica_type == ReplicaType::DISK) {
         MasterMetricManager::instance().dec_file_cache_nums();
+    }
+
+    if (enable_ha_ && oplog_store_) {
+        AppendOrPersistOrEnqueue("PutRevoke", OpType::PUT_REVOKE, key, {},
+                                 PendingMutationKind::EVICT_MEM_REPLICAS);
     }
 
     metadata.EraseReplicas([replica_type](const Replica& replica) {
@@ -2366,6 +2428,10 @@ auto MasterService::Remove(const std::string& key, bool force)
     }
 
     // Remove object metadata
+    if (enable_ha_ && oplog_store_) {
+        AppendOrPersistOrEnqueue("Remove", OpType::REMOVE, key, {},
+                                 PendingMutationKind::CLEAR_ALL_REPLICAS);
+    }
     accessor.Erase();
     ErasePromotionTaskIfPresent(accessor.GetShard(), key);
     return {};
@@ -4684,9 +4750,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     uint64_t freed =
                         try_evict_or_offload(it->first, it->second, shard);
                     total_freed_size += freed;
-                    if (it->second.IsValid() == false) {
+                    bool was_valid = it->second.IsValid();
+                    if (!was_valid) {
+                        // Last replica removed - write REMOVE OpLog
+                        if (enable_ha_ && oplog_store_) {
+                            AppendOrPersistOrEnqueue(
+                                "BatchEvict(last replica REMOVE)",
+                                OpType::REMOVE, it->first, {},
+                                PendingMutationKind::CLEAR_ALL_REPLICAS);
+                        }
                         it = shard->metadata.erase(it);
                     } else {
+                        // Still has disk/local replicas - write PUT_END
+                        if (enable_ha_ && oplog_store_) {
+                            AppendOrPersistOrEnqueue(
+                                "BatchEvict(has remaining replicas)",
+                                OpType::PUT_END, it->first,
+                                SerializeMetadataForOpLogWithoutMemReplicas(
+                                    it->second),
+                                PendingMutationKind::EVICT_MEM_REPLICAS);
+                        }
                         ++it;
                     }
                     if (freed > 0) {
@@ -4747,9 +4830,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
-                        if (it->second.IsValid() == false) {
+                        bool was_valid = it->second.IsValid();
+                        if (!was_valid) {
+                            // Last replica removed - write REMOVE OpLog
+                            if (enable_ha_ && oplog_store_) {
+                                AppendOrPersistOrEnqueue(
+                                    "BatchEvict(second pass, last replica REMOVE)",
+                                    OpType::REMOVE, it->first, {},
+                                    PendingMutationKind::CLEAR_ALL_REPLICAS);
+                            }
                             it = shard->metadata.erase(it);
                         } else {
+                            // Still has disk/local replicas - write PUT_END
+                            if (enable_ha_ && oplog_store_) {
+                                AppendOrPersistOrEnqueue(
+                                    "BatchEvict(second pass, has remaining replicas)",
+                                    OpType::PUT_END, it->first,
+                                    SerializeMetadataForOpLogWithoutMemReplicas(
+                                        it->second),
+                                    PendingMutationKind::EVICT_MEM_REPLICAS);
+                            }
                             ++it;
                         }
                         if (freed > 0) {
@@ -4800,9 +4900,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
-                        if (it->second.IsValid() == false) {
+                        bool was_valid = it->second.IsValid();
+                        if (!was_valid) {
+                            // Last replica removed - write REMOVE OpLog
+                            if (enable_ha_ && oplog_store_) {
+                                AppendOrPersistOrEnqueue(
+                                    "BatchEvict(soft pin, last replica REMOVE)",
+                                    OpType::REMOVE, it->first, {},
+                                    PendingMutationKind::CLEAR_ALL_REPLICAS);
+                            }
                             it = shard->metadata.erase(it);
                         } else {
+                            // Still has disk/local replicas - write PUT_END
+                            if (enable_ha_ && oplog_store_) {
+                                AppendOrPersistOrEnqueue(
+                                    "BatchEvict(soft pin, has remaining replicas)",
+                                    OpType::PUT_END, it->first,
+                                    SerializeMetadataForOpLogWithoutMemReplicas(
+                                        it->second),
+                                    PendingMutationKind::EVICT_MEM_REPLICAS);
+                            }
                             ++it;
                         }
                         if (freed > 0) {
@@ -4921,8 +5038,23 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             total_freed_size += metadata.size * erased;
             shard_evicted_count++;
             if (!metadata.IsValid()) {
+                // Last replica removed - write REMOVE OpLog
+                if (enable_ha_ && oplog_store_) {
+                    AppendOrPersistOrEnqueue(
+                        "NoFBatchEvict(last replica REMOVE)",
+                        OpType::REMOVE, it->first, {},
+                        PendingMutationKind::CLEAR_ALL_REPLICAS);
+                }
                 it = shard->metadata.erase(it);
             } else {
+                // Still has other replicas - write PUT_END
+                if (enable_ha_ && oplog_store_) {
+                    AppendOrPersistOrEnqueue(
+                        "NoFBatchEvict(has remaining replicas)",
+                        OpType::PUT_END, it->first,
+                        SerializeMetadataForOpLogWithoutMemReplicas(metadata),
+                        PendingMutationKind::EVICT_MEM_REPLICAS);
+                }
                 ++it;
             }
         }
