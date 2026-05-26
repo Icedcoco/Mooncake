@@ -46,7 +46,7 @@ struct StandbySegmentInfo {
     bool is_memory_segment{false};
     std::string file_path;  // empty for memory segments
 
-    YLT_REFL(segment_name, transport_endpoint, capacity,
+    YLT_REFL(StandbySegmentInfo, segment_name, transport_endpoint, capacity,
              is_memory_segment, file_path);
 };
 
@@ -60,7 +60,7 @@ struct StandbySnapshot {
     std::vector<StandbySegmentInfo> segments;
     std::vector<std::pair<std::string, StandbyObjectMetadata>> objects;
 
-    YLT_REFL(oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
 };
 
 /**
