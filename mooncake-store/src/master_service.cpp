@@ -322,6 +322,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
+    if (enable_ha_) {
+        pending_mutations_running_.store(true);
+        pending_mutations_thread_ = std::thread(&MasterService::PendingMutationWorker, this);
+    }
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -386,6 +391,13 @@ MasterService::~MasterService() {
     snapshot_running_ = false;
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
+    if (pending_mutations_running_.load()) {
+        pending_mutations_running_.store(false);
+        pending_mutations_cv_.notify_all();
+        if (pending_mutations_thread_.joinable()) {
+            pending_mutations_thread_.join();
+        }
+    }
     graceful_unmount_scheduler_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -6710,6 +6722,98 @@ ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
     }
     HAMetricManager::instance().inc_oplog_etcd_write_failures();
     return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+void MasterService::EnqueuePendingMutation(PendingMutation m) {
+    {
+        std::lock_guard<std::mutex> lock(pending_mutations_mutex_);
+        if (pending_mutations_.size() >= kMaxPendingMutations) {
+            LOG(ERROR) << "pending_mutations_ queue full, dropping mutation for key: " << m.key;
+            return;
+        }
+        pending_mutations_.push_back(std::move(m));
+    }
+    pending_mutations_cv_.notify_one();
+}
+
+void MasterService::PendingMutationWorker() {
+    while (pending_mutations_running_.load()) {
+        PendingMutation mutation;
+        {
+            std::unique_lock<std::mutex> lock(pending_mutations_mutex_);
+            auto now = std::chrono::steady_clock::now();
+            auto it = std::find_if(pending_mutations_.begin(), pending_mutations_.end(),
+                                   [now](const PendingMutation& m) {
+                                       return m.next_retry_at <= now;
+                                   });
+            if (it == pending_mutations_.end()) {
+                pending_mutations_cv_.wait_for(lock, std::chrono::seconds(1));
+                continue;
+            }
+            mutation = std::move(*it);
+            pending_mutations_.erase(it);
+        }
+        if (!ProcessPendingMutationOnce(mutation)) {
+            LOG(ERROR) << "ProcessPendingMutationOnce failed permanently for key: " << mutation.key;
+        }
+    }
+}
+
+bool MasterService::ProcessPendingMutationOnce(PendingMutation& m) {
+    ErrorCode err = oplog_store_->WriteOpLog(m.oplog_entry, true);
+    if (err == ErrorCode::OK) {
+        VLOG(1) << "PendingMutation retry successful for key: " << m.key;
+        return true;
+    }
+    HAMetricManager::instance().inc_oplog_etcd_write_retries();
+    ++m.attempt;
+    if (m.attempt >= 10) {
+        LOG(ERROR) << "PendingMutation exhausted retries for key: " << m.key;
+        return false;
+    }
+    auto backoff = std::chrono::milliseconds(200) * (1 << m.attempt);
+    if (backoff > std::chrono::seconds(30)) {
+        backoff = std::chrono::seconds(30);
+    }
+    m.next_retry_at = std::chrono::steady_clock::now() + backoff;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutations_mutex_);
+        if (pending_mutations_.size() >= kMaxPendingMutations) {
+            LOG(ERROR) << "pending_mutations_ queue full, dropping mutation for key: " << m.key;
+            return false;
+        }
+        pending_mutations_.push_back(std::move(m));
+    }
+    pending_mutations_cv_.notify_one();
+    return true;
+}
+
+void MasterService::EnqueueRetryOnPersistFailure(const char* why, OpType type, const std::string& key,
+                                                 const std::string& payload, PendingMutationKind kind) {
+    LOG(WARNING) << why << " for key: " << key << ", enqueueing for retry";
+    OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    PendingMutation m;
+    m.kind = kind;
+    m.key = key;
+    m.segment_name = "";
+    m.oplog_entry = entry;
+    m.attempt = 0;
+    m.next_retry_at = std::chrono::steady_clock::now();
+    EnqueuePendingMutation(std::move(m));
+}
+
+void MasterService::AppendOrPersistOrEnqueue(const char* why, OpType type, const std::string& key,
+                                             const std::string& payload, PendingMutationKind kind) {
+    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    auto result = PersistOpLogEntryWithSyncRetries(entry);
+    if (result != ErrorCode::OK) {
+        EnqueueRetryOnPersistFailure(why, type, key, payload, kind);
+    }
+}
+
+void MasterService::AppendOrPersistOrEnqueueLazy(const char* why, OpType type, const std::string& key,
+                                                  const std::string& payload, PendingMutationKind kind) {
+    AppendOrPersistOrEnqueue(why, type, key, payload, kind);
 }
 
 }  // namespace mooncake

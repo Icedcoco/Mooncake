@@ -1660,6 +1660,39 @@ class MasterService {
         const std::vector<Replica::Descriptor>& replicas) const;
     ErrorCode PersistOpLogEntryWithSyncRetries(
         const OpLogEntry& entry) const;
+
+    // Pending mutation retry queue
+    enum class PendingMutationKind : uint8_t {
+        EVICT_MEM_REPLICAS = 1,
+        CLEAR_ALL_REPLICAS = 2,
+        CLEAR_REPLICAS_ON_SEGMENT = 3,
+    };
+
+    struct PendingMutation {
+        PendingMutationKind kind;
+        std::string key;
+        std::string segment_name;
+        OpLogEntry oplog_entry;
+        uint32_t attempt{0};
+        std::chrono::steady_clock::time_point next_retry_at{};
+    };
+
+    void EnqueuePendingMutation(PendingMutation m);
+    void PendingMutationWorker();
+    bool ProcessPendingMutationOnce(PendingMutation& m);
+    void EnqueueRetryOnPersistFailure(const char* why, OpType type, const std::string& key,
+                                      const std::string& payload, PendingMutationKind kind);
+    void AppendOrPersistOrEnqueue(const char* why, OpType type, const std::string& key,
+                                 const std::string& payload, PendingMutationKind kind);
+    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type, const std::string& key,
+                                     const std::string& payload, PendingMutationKind kind);
+
+    std::mutex pending_mutations_mutex_;
+    std::condition_variable pending_mutations_cv_;
+    std::deque<PendingMutation> pending_mutations_;
+    std::atomic<bool> pending_mutations_running_{false};
+    std::thread pending_mutations_thread_;
+    static constexpr size_t kMaxPendingMutations = 10000;
 };
 
 }  // namespace mooncake
