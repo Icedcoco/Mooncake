@@ -31,6 +31,10 @@
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store.h"
+#include "ha/oplog/oplog_store_factory.h"
+#include "allocator.h"
 
 namespace mooncake {
 namespace ha {
@@ -1637,6 +1641,23 @@ class MasterService {
     std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
+
+    // OpLog publishing
+    std::shared_ptr<OpLogStore> oplog_store_;
+    OpLogManager oplog_manager_;
+
+    // OpLog publishing helpers
+    void AppendOpLogAndNotify(OpType type, const std::string& key,
+                              const std::string& payload = {});
+    tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
+        OpType type, const std::string& key,
+        const std::string& payload = {});
+    std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
+    std::string SerializeMetadataForOpLogWithoutMemReplicas(
+        const ObjectMetadata& metadata) const;
+    std::string SerializeMetadataForOpLogFromReplicaDescriptors(
+        const UUID& client_id, uint64_t size,
+        const std::vector<Replica::Descriptor>& replicas) const;
 };
 
 }  // namespace mooncake

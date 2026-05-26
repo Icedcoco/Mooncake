@@ -297,6 +297,29 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::JobDispatchThreadFunc, this);
     VLOG(1) << "action=start_job_dispatch_thread";
 
+    if (enable_ha_ && !cluster_id_.empty()) {
+        auto store = OpLogStoreFactory::Create(
+            config.oplog_store_type.empty()
+                ? OpLogStoreType::ETCD
+                : ParseOpLogStoreType(config.oplog_store_type),
+            cluster_id_,
+            OpLogStoreRole::WRITER,
+            config.oplog_store_root_dir,
+            config.oplog_poll_interval_ms);
+        if (store) {
+            auto unique_store = std::move(store);
+            std::shared_ptr<OpLogStore> shared_store(std::move(unique_store));
+            oplog_store_ = shared_store;
+            oplog_manager_.SetOpLogStore(oplog_store_);
+            uint64_t max_seq = 0;
+            if (oplog_store_->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
+                oplog_manager_.SetInitialSequenceId(max_seq);
+            }
+        } else {
+            LOG(WARNING) << "failed to create HA OpLog writer";
+        }
+    }
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
