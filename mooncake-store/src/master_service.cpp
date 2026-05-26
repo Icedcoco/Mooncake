@@ -32,6 +32,8 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils.h"
+#include "ha_metric_manager.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 
@@ -6619,6 +6621,95 @@ void MasterService::GracefulUnmountScheduler::TimerLoop() {
             }
         }
     }
+}
+
+std::string MasterService::SerializeMetadataForOpLog(
+    const ObjectMetadata& metadata) const {
+    MetadataPayload payload;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.size;
+
+    // Extract replica descriptors - get them all at once
+    const auto& replicas = metadata.GetAllReplicas();
+    payload.replicas.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        payload.replicas.push_back(replica.get_descriptor());
+    }
+
+    // NOTE: Lease information is NOT serialized because:
+    // 1. Standby does not perform eviction, so lease info is not used
+    // 2. After promotion, new Primary should grant fresh leases, not restore old ones
+
+    // Serialize using struct_pack (msgpack binary format)
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
+    const ObjectMetadata& metadata) const {
+    MetadataPayload payload;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.size;
+
+    const auto& replicas = metadata.GetAllReplicas();
+    payload.replicas.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        if (replica.type() == ReplicaType::MEMORY) {
+            continue;
+        }
+        payload.replicas.push_back(replica.get_descriptor());
+    }
+
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
+    const UUID& client_id, uint64_t size,
+    const std::vector<Replica::Descriptor>& replicas) const {
+    MetadataPayload payload;
+    payload.client_id = client_id;
+    payload.size = size;
+    payload.replicas = replicas;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
+                                         const std::string& payload) {
+    oplog_manager_.Append(type, key, payload);
+}
+
+tl::expected<uint64_t, ErrorCode> MasterService::AppendOpLogAndNotifyDurable(
+    OpType type, const std::string& key,
+    const std::string& payload) {
+    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    auto result = PersistOpLogEntryWithSyncRetries(entry);
+    if (result != ErrorCode::OK) {
+        return tl::unexpected(result);
+    }
+    return entry.sequence_id;
+}
+
+ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
+    const OpLogEntry& entry) const {
+    uint32_t attempt = 0;
+    auto backoff = std::chrono::milliseconds(200);
+    while (attempt < 10) {
+        ErrorCode err = oplog_store_->WriteOpLog(entry, true);
+        if (err == ErrorCode::OK) {
+            return err;
+        }
+        HAMetricManager::instance().inc_oplog_etcd_write_retries();
+        std::this_thread::sleep_for(backoff);
+        backoff *= 2;
+        if (backoff > std::chrono::seconds(30)) {
+            backoff = std::chrono::seconds(30);
+        }
+        ++attempt;
+    }
+    HAMetricManager::instance().inc_oplog_etcd_write_failures();
+    return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 }  // namespace mooncake

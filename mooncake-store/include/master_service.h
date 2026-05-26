@@ -1658,6 +1658,8 @@ class MasterService {
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const UUID& client_id, uint64_t size,
         const std::vector<Replica::Descriptor>& replicas) const;
+    ErrorCode PersistOpLogEntryWithSyncRetries(
+        const OpLogEntry& entry) const;
 };
 
 }  // namespace mooncake
