@@ -509,6 +509,20 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+
+    // Publish SEGMENT_MOUNT OpLog for HA
+    if (enable_ha_ && oplog_store_) {
+        SegmentMountOp op;
+        op.segment_name = segment.name;
+        op.transport_endpoint = segment.te_endpoint;
+        op.capacity = segment.size;
+        op.is_memory_segment = true;  // based on actual segment type
+        op.file_path.clear();
+        auto bytes = struct_pack::serialize(op);
+        AppendOpLogAndNotify(OpType::SEGMENT_MOUNT, segment.te_endpoint,
+                             std::string(bytes.begin(), bytes.end()));
+    }
+
     return {};
 }
 
@@ -718,6 +732,18 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+
+    // Publish SEGMENT_UNMOUNT OpLog for HA
+    if (enable_ha_ && oplog_store_) {
+        std::string segment_name;
+        std::string te_endpoint;
+        segment_manager_.GetSegmentBasicInfo(segment_id, segment_name, te_endpoint);
+        SegmentUnmountOp op{te_endpoint};
+        auto bytes = struct_pack::serialize(op);
+        AppendOpLogAndNotify(OpType::SEGMENT_UNMOUNT, te_endpoint,
+                             std::string(bytes.begin(), bytes.end()));
+    }
+
     return {};
 }
 
