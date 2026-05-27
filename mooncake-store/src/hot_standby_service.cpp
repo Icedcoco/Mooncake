@@ -664,8 +664,13 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
         return false;
     }
 
-    // Get applied sequence ID
-    out.oplog_sequence_id = GetLatestAppliedSequenceId();
+    // Get applied sequence ID (inline to avoid recursive mutex lock)
+    if (oplog_applier_) {
+        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
+        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
+    } else {
+        out.oplog_sequence_id = applied_seq_id_.load();
+    }
 
     // Export object metadata
     if (metadata_store_) {

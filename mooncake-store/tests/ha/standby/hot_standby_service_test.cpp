@@ -410,6 +410,44 @@ TEST_F(HotStandbyServiceTest, TestGetLatestAppliedSequenceId) {
     EXPECT_EQ(0u, seq);
 }
 
+// ========== 6.1.6a ExportStandbySnapshot tests ==========
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_NotRunning) {
+    StandbySnapshot snapshot;
+    EXPECT_FALSE(service_->ExportStandbySnapshot(snapshot));
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(42u, snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, snapshot.objects.size());
+    EXPECT_EQ("key-1", snapshot.objects[0].first);
+    EXPECT_EQ(4096u, snapshot.objects[0].second.size);
+    // Segment registry is empty because snapshot-only standby has no oplog_applier
+    EXPECT_TRUE(snapshot.segments.empty());
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(LoadedSnapshot{})));
+
+    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(0u, snapshot.oplog_sequence_id);
+    EXPECT_TRUE(snapshot.objects.empty());
+    EXPECT_TRUE(snapshot.segments.empty());
+}
+
 // ========== 6.1.7 Replication loop tests ==========
 
 TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
