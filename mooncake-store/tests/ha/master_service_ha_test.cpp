@@ -60,7 +60,22 @@ class MasterServiceHATest : public ::testing::Test {
         config.replica_num = 1;
         auto put_start = service.PutStart(client_id, key, slice_length, config);
         EXPECT_TRUE(put_start.has_value());
-        EXPECT_TRUE(service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        EXPECT_TRUE(
+            service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        return key;
+    }
+
+    std::string PutObjectOnSegment(MasterService& service, const UUID& client_id,
+                                   const std::string& key,
+                                   const std::string& segment_name,
+                                   size_t slice_length = 1024) const {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+        auto put_start = service.PutStart(client_id, key, slice_length, config);
+        EXPECT_TRUE(put_start.has_value());
+        EXPECT_TRUE(
+            service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
         return key;
     }
 };
@@ -171,6 +186,233 @@ TEST_F(MasterServiceHATest, BatchRemovePersistFailureSkipsErase) {
         ASSERT_TRUE(exist.has_value());
         EXPECT_FALSE(exist.value()) << "Key should be removed: " << key;
     }
+}
+
+// PutRevoke on an object with only a MEMORY replica publishes REMOVE OpLog.
+TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "put_revoke_single_key";
+    PutObject(*service, client_id, key);
+
+    auto res = service->PutRevoke(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+}
+
+// PutRevoke(MEMORY) on an object with MEMORY + LOCAL_DISK publishes PUT_END
+// with the LOCAL_DISK descriptor.
+TEST_F(MasterServiceHATest, PutRevokeKeepsLocalDiskPublishesPutEndOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "put_revoke_mixed_key";
+    PutObject(*service, client_id, key);
+
+    Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    auto add_res = service->AddReplica(client_id, key, local_disk_replica);
+    ASSERT_TRUE(add_res.has_value());
+
+    auto res = service->PutRevoke(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_FALSE(entry.payload.empty());
+}
+
+// EvictDiskReplica on an object with MEMORY + DISK publishes PUT_END with the
+// MEMORY descriptor.
+TEST_F(MasterServiceHATest, EvictDiskReplicaPublishesPutEndOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "evict_disk_key";
+    PutObject(*service, client_id, key);
+
+    Replica disk_replica("/tmp/disk_file", 1024, ReplicaStatus::COMPLETE);
+    auto add_res = service->AddReplica(client_id, key, disk_replica);
+    ASSERT_TRUE(add_res.has_value());
+
+    auto res = service->EvictDiskReplica(client_id, key, ReplicaType::DISK);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_FALSE(entry.payload.empty());
+}
+
+// BatchReplicaClear with empty segment_name clears all replicas and publishes
+// REMOVE OpLog.
+TEST_F(MasterServiceHATest, BatchReplicaClearAllPublishesRemoveOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "batch_clear_all_key";
+    PutObject(*service, client_id, key);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    auto res = service->BatchReplicaClear({key}, client_id, "");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1u, res->size());
+    EXPECT_EQ(key, (*res)[0]);
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::REMOVE, entry.op_type);
+}
+
+// CopyEnd publishes PUT_END OpLog with the updated replica set.
+TEST_F(MasterServiceHATest, CopyEndPublishesPutEndOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    const std::string key = "copy_end_key";
+    const UUID client_id = generate_uuid();
+    PutObjectOnSegment(*service, client_id, key, "seg1");
+
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    auto copy_start =
+        service->CopyStart(client_id, key, "seg1", {"seg2"});
+    ASSERT_TRUE(copy_start.has_value());
+
+    auto res = service->CopyEnd(client_id, key);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_FALSE(entry.payload.empty());
+}
+
+// MoveEnd publishes PUT_END OpLog with the updated replica set (source
+// removed).
+TEST_F(MasterServiceHATest, MoveEndPublishesPutEndOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    const std::string key = "move_end_key";
+    const UUID client_id = generate_uuid();
+    PutObjectOnSegment(*service, client_id, key, "seg1");
+
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    auto move_start =
+        service->MoveStart(client_id, key, "seg1", "seg2");
+    ASSERT_TRUE(move_start.has_value());
+
+    auto res = service->MoveEnd(client_id, key);
+    ASSERT_TRUE(res.has_value());
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_FALSE(entry.payload.empty());
+}
+
+// BatchReplicaClear on one segment keeps replicas on other segments and
+// publishes PUT_END.
+TEST_F(MasterServiceHATest,
+       BatchReplicaClearSegmentKeepsOtherSegmentsPublishesPutEndOpLog) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    const std::string key = "batch_clear_segment_key";
+    const UUID client_id = generate_uuid();
+    PutObjectOnSegment(*service, client_id, key, "seg1");
+
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    auto copy_start =
+        service->CopyStart(client_id, key, "seg1", {"seg2"});
+    ASSERT_TRUE(copy_start.has_value());
+
+    auto copy_end = service->CopyEnd(client_id, key);
+    ASSERT_TRUE(copy_end.has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    auto res = service->BatchReplicaClear({key}, client_id, "seg1");
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(1u, res->size());
+    EXPECT_EQ(key, (*res)[0]);
+
+    OpLogEntry entry;
+    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    EXPECT_EQ(OpType::PUT_END, entry.op_type);
+    EXPECT_FALSE(entry.payload.empty());
 }
 
 }  // namespace mooncake::test

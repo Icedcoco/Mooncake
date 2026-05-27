@@ -1731,6 +1731,14 @@ class MasterService {
     tl::expected<void, ErrorCode> PersistRemoveForHA(
         const char* why, const std::string& key);
 
+    /**
+     * Build replica descriptors after removing replicas matching pred_fn.
+     * Returns empty if no complete replicas remain.
+     */
+    std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_remove) const;
+
     std::mutex pending_mutations_mutex_;
     std::condition_variable pending_mutations_cv_;
     std::deque<PendingMutation> pending_mutations_;

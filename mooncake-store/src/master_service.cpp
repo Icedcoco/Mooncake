@@ -1239,26 +1239,24 @@ auto MasterService::BatchReplicaClear(
 
             // Determine OpLog type based on remaining replicas after segment clear
             if (enable_ha_ && oplog_store_) {
-                // Check if this will leave valid replicas
-                bool will_have_valid_replicas = metadata.HasReplica(
+                auto remaining = BuildRemainingReplicaDescriptors(
+                    metadata,
                     [&match_replica_on_segment](const Replica& r) {
-                        return !match_replica_on_segment(r) &&
-                               (!r.is_memory_replica() ||
-                                !r.has_invalid_mem_handle());
+                        return match_replica_on_segment(r);
                     });
-                if (enable_ha_ && oplog_store_) {
-                    tl::expected<OpLogEntry, ErrorCode> persist_result;
-                    if (!will_have_valid_replicas) {
-                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::REMOVE, key, {});
-                    } else {
-                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::PUT_END, key,
-                            SerializeMetadataForOpLogWithoutMemReplicas(metadata));
-                    }
-                    if (!persist_result) {
-                        continue;  // skip this key on persist failure
-                    }
+
+                tl::expected<OpLogEntry, ErrorCode> persist_result;
+                if (remaining.empty()) {
+                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        OpType::REMOVE, key, {});
+                } else {
+                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        OpType::PUT_END, key,
+                        SerializeMetadataForOpLogFromReplicaDescriptors(
+                            metadata.client_id, metadata.size, remaining));
+                }
+                if (!persist_result) {
+                    continue;  // skip this key on persist failure
                 }
             }
 
@@ -1752,26 +1750,39 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
-        return {};
+    } else {
+        metadata.VisitReplicas(
+            [client_id](const Replica& rep) {
+                return rep.type() == ReplicaType::LOCAL_DISK &&
+                       rep.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            },
+            [&replica](Replica& rep) {
+                rep.get_descriptor()
+                    .get_local_disk_descriptor()
+                    .transport_endpoint = replica.get_descriptor()
+                                              .get_local_disk_descriptor()
+                                              .transport_endpoint;
+                rep.get_descriptor().get_local_disk_descriptor().object_size =
+                    replica.get_descriptor()
+                        .get_local_disk_descriptor()
+                        .object_size;
+            });
     }
 
-    metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
-        });
+    if (enable_ha_ && oplog_store_) {
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, [](const Replica&) { return false; });
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::PUT_END, key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(
+                metadata.client_id, metadata.size, remaining));
+        if (!persist_result) {
+            LOG(ERROR) << "AddReplica: OpLog persist failed for key=" << key;
+        }
+    }
+
     return {};
 }
 
@@ -1814,8 +1825,25 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (enable_ha_ && oplog_store_) {
-        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::PUT_REVOKE, key, {});
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata,
+            [replica_type](const Replica& r) {
+                if (replica_type == ReplicaType::ALL) {
+                    return r.is_memory_replica() || r.is_nof_replica();
+                }
+                return r.type() == replica_type;
+            });
+
+        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        if (remaining.empty()) {
+            persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::REMOVE, key, {});
+        } else {
+            persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::PUT_END, key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(
+                    metadata.client_id, metadata.size, remaining));
+        }
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -2127,6 +2155,36 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     auto& metadata = accessor.Get();
 
+    if (enable_ha_ && oplog_store_) {
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata,
+            [replica_type, &client_id](const Replica& r) {
+                if (replica_type == ReplicaType::DISK) {
+                    return r.is_disk_replica();
+                } else if (replica_type == ReplicaType::LOCAL_DISK) {
+                    return r.is_local_disk_replica() &&
+                           r.get_descriptor()
+                                   .get_local_disk_descriptor()
+                                   .client_id == client_id;
+                }
+                return false;
+            });
+
+        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        if (remaining.empty()) {
+            persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::REMOVE, key, {});
+        } else {
+            persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::PUT_END, key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(
+                    metadata.client_id, metadata.size, remaining));
+        }
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
+    }
+
     if (replica_type == ReplicaType::DISK) {
         metadata.EraseReplicas(
             [](const Replica& replica) { return replica.is_disk_replica(); });
@@ -2319,6 +2377,20 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
             all_complete = false;
         } else {
             replica->mark_complete();
+        }
+    }
+
+    if (enable_ha_ && oplog_store_) {
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, [](const Replica&) { return false; });
+
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::PUT_END, key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(
+                metadata.client_id, metadata.size, remaining));
+        if (!persist_result) {
+            LOG(ERROR) << "CopyEnd: OpLog persist failed for key=" << key;
+            // Copy completed locally but standby won't see new replica.
         }
     }
 
@@ -2539,6 +2611,23 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
         // Mark replica as complete
         replica->mark_complete();
+    }
+
+    if (enable_ha_ && oplog_store_) {
+        // After move: target is complete, source is gone
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata,
+            [&source_id](const Replica& r) {
+                return r.id() == source_id;
+            });
+
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::PUT_END, key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(
+                metadata.client_id, metadata.size, remaining));
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
     }
 
     // Remove the source replica and release its space later.
@@ -3415,6 +3504,20 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         staged->is_processing()) {
         staged->mark_complete();
         committed = true;
+    }
+
+    if (committed && enable_ha_ && oplog_store_) {
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, [](const Replica&) { return false; });
+
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::PUT_END, key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(
+                metadata.client_id, metadata.size, remaining));
+        if (!persist_result) {
+            LOG(ERROR) << "NotifyPromotionSuccess: OpLog persist failed for key="
+                       << key;
+        }
     }
 
     // Drop the source LOCAL_DISK replica's refcnt and erase the task.
@@ -7264,6 +7367,20 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
         return tl::unexpected(result.error());
     }
     return {};
+}
+
+std::vector<Replica::Descriptor>
+MasterService::BuildRemainingReplicaDescriptors(
+    const ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& should_remove) const {
+    std::vector<Replica::Descriptor> remaining;
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (!should_remove(replica) &&
+            replica.status() == ReplicaStatus::COMPLETE) {
+            remaining.push_back(replica.get_descriptor());
+        }
+    }
+    return remaining;
 }
 
 }  // namespace mooncake
