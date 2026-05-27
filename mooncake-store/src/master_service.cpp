@@ -934,6 +934,96 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     return status;
 }
 
+void MasterService::RestoreFromStandbySnapshot(
+    const std::vector<std::pair<std::string, StandbyObjectMetadata>>& objects,
+    uint64_t initial_oplog_sequence_id,
+    const std::vector<StandbySegmentInfo>& segments) {
+    // 1. Set OpLogManager initial sequence.
+    uint64_t start_seq = initial_oplog_sequence_id;
+    if (oplog_store_) {
+        uint64_t max_seq = 0;
+        if (oplog_store_->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
+            start_seq = std::max(start_seq, max_seq);
+        }
+    }
+    oplog_manager_.SetInitialSequenceId(start_seq);
+
+    // 2. Build allocator keepalive map for standby segments.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_allocs;
+    for (const auto& seg : segments) {
+        if (seg.is_memory_segment) {
+            standby_allocs[seg.transport_endpoint] =
+                std::make_shared<DummyBufferAllocator>(seg.segment_name,
+                                                       seg.transport_endpoint);
+        }
+        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
+            invalid_replica_endpoints_.insert(seg.transport_endpoint);
+        }
+    }
+
+    // 3. Restore object metadata.
+    for (const auto& [key, standby_meta] : objects) {
+        std::vector<Replica> replicas;
+        replicas.reserve(standby_meta.replicas.size());
+
+        for (const auto& desc : standby_meta.replicas) {
+            if (desc.is_memory_replica()) {
+                const auto& mem_desc = desc.get_memory_descriptor();
+                const std::string& endpoint =
+                    mem_desc.buffer_descriptor.transport_endpoint_;
+                auto it = standby_allocs.find(endpoint);
+                if (it != standby_allocs.end()) {
+                    auto alloc = it->second;
+                    replicas.emplace_back(
+                        std::make_unique<AllocatedBuffer>(alloc, nullptr, 0),
+                        desc.status);
+                } else {
+                    invalid_replica_endpoints_.insert(endpoint);
+                }
+            } else if (desc.is_nof_replica()) {
+                const auto& nof_desc = desc.get_nof_descriptor();
+                const std::string& endpoint =
+                    nof_desc.buffer_descriptor.transport_endpoint_;
+                auto it = standby_allocs.find(endpoint);
+                if (it != standby_allocs.end()) {
+                    auto alloc = it->second;
+                    replicas.emplace_back(
+                        std::make_unique<AllocatedBuffer>(alloc, nullptr, 0),
+                        desc.status, ReplicaType::NOF_SSD);
+                } else {
+                    invalid_replica_endpoints_.insert(endpoint);
+                }
+            } else if (desc.is_disk_replica()) {
+                const auto& disk_desc = desc.get_disk_descriptor();
+                replicas.emplace_back(disk_desc.file_path, disk_desc.object_size,
+                                      desc.status);
+            } else if (desc.is_local_disk_replica()) {
+                const auto& local_disk_desc = desc.get_local_disk_descriptor();
+                replicas.emplace_back(local_disk_desc.client_id,
+                                      local_disk_desc.object_size,
+                                      local_disk_desc.transport_endpoint,
+                                      desc.status);
+            }
+        }
+
+        auto shard_idx = getShardIndex(key);
+        MetadataShardAccessorRW shard(this, shard_idx);
+        auto now = std::chrono::system_clock::now();
+        shard->metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(key),
+            std::forward_as_tuple(standby_meta.client_id, now, standby_meta.size,
+                                  std::move(replicas), false, false,
+                                  ObjectDataType::UNKNOWN));
+        shard->processing_keys.erase(key);
+    }
+
+    // 4. Log the result.
+    LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
+              << segments.size() << " segments, initial_seq_id=" << start_seq
+              << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+}
+
 auto MasterService::QueryIp(const UUID& client_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();

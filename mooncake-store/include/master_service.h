@@ -35,6 +35,7 @@
 #include "ha/oplog/oplog_store.h"
 #include "ha/oplog/oplog_store_factory.h"
 #include "allocator.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 namespace ha {
@@ -637,6 +638,15 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+
+    /**
+     * @brief Restore primary state from standby promotion context.
+     * Called once at promotion time before serving requests.
+     */
+    void RestoreFromStandbySnapshot(
+        const std::vector<std::pair<std::string, StandbyObjectMetadata>>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments);
 
     /**
      * @brief Query the status of a task
@@ -1660,6 +1670,9 @@ class MasterService {
         const std::vector<Replica::Descriptor>& replicas) const;
     ErrorCode PersistOpLogEntryWithSyncRetries(
         const OpLogEntry& entry) const;
+
+    // Invalid endpoints from standby that don't exist locally
+    std::unordered_set<std::string> invalid_replica_endpoints_;
 
     // Pending mutation retry queue
     enum class PendingMutationKind : uint8_t {

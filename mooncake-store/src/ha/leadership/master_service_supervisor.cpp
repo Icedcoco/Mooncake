@@ -296,13 +296,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         accept_standby_runtime_updates.store(false, std::memory_order_release);
-        auto promote_standby = standby_controller->PromoteStandby();
-        if (promote_standby != ErrorCode::OK) {
+        auto promotion_ctx = standby_controller->PromoteStandbyAndExport();
+        if (!promotion_ctx) {
             EnterStandbyMode(admin_server, *standby_controller,
                              accept_standby_runtime_updates,
                              leadership_session->view);
             if (HandleSupervisorError("promote standby for serve",
-                                      promote_standby, spec.type)) {
+                                      promotion_ctx.error(), spec.type)) {
                 return -1;
             }
             continue;
@@ -347,6 +347,16 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             mooncake::WrappedMasterServiceConfig(
                 config, leadership_session->view.view_version));
+
+        // Restore from standby if we have context
+        if (promotion_ctx->applied_seq_id > 0 ||
+            !promotion_ctx->objects.empty() ||
+            !promotion_ctx->segments.empty()) {
+            wrapped_master_service->RestoreFromStandby(
+                promotion_ctx->objects, promotion_ctx->applied_seq_id,
+                promotion_ctx->segments);
+        }
+
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto serve_preflight =
