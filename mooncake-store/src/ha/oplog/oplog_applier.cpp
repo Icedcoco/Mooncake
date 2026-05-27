@@ -605,7 +605,7 @@ void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
                    << entry.object_key;
         return;
     }
-    segment_registry_.OnSegmentUnmount(entry.object_key);
+    segment_registry_.OnSegmentUnmount(op.transport_endpoint);
     HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
