@@ -1295,6 +1295,31 @@ auto MasterService::GetReplicaList(const std::string& key)
                 replica_list.emplace_back(replica.get_descriptor());
             });
 
+        // Filter out replicas pointing to invalid endpoints from standby.
+        if (!invalid_replica_endpoints_.empty()) {
+            replica_list.erase(
+                std::remove_if(
+                    replica_list.begin(), replica_list.end(),
+                    [&](const Replica::Descriptor& desc) {
+                        std::optional<std::string> endpoint;
+                        if (desc.is_memory_replica()) {
+                            endpoint = desc.get_memory_descriptor()
+                                           .buffer_descriptor
+                                           .transport_endpoint_;
+                        } else if (desc.is_nof_replica()) {
+                            endpoint = desc.get_nof_descriptor()
+                                           .buffer_descriptor
+                                           .transport_endpoint_;
+                        } else if (desc.is_local_disk_replica()) {
+                            endpoint =
+                                desc.get_local_disk_descriptor().transport_endpoint;
+                        }
+                        return endpoint.has_value() &&
+                               invalid_replica_endpoints_.count(*endpoint) > 0;
+                    }),
+                replica_list.end());
+        }
+
         if (replica_list.empty()) {
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
