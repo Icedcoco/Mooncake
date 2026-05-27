@@ -425,6 +425,27 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.snapshot_id = descriptor.snapshot_id;
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
+
+        // Extract memory segments from deserialized SegmentManager
+        ScopedSegmentAccess segment_access =
+            segment_manager.getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        segment_access.GetAllSegments(all_segments);
+        SegmentView view = segment_manager.getView();
+        for (const auto& [seg, client_id] : all_segments) {
+            MountedSegment mounted;
+            if (view.GetMountedSegment(seg.id, mounted) == ErrorCode::OK) {
+                if (mounted.buf_allocator != nullptr) {
+                    StandbySegmentInfo info;
+                    info.segment_name = seg.name;
+                    info.transport_endpoint = seg.te_endpoint;
+                    info.capacity = seg.size;
+                    info.is_memory_segment = true;
+                    snapshot.segments.push_back(std::move(info));
+                }
+            }
+        }
+
         return std::optional<LoadedSnapshot>(std::move(snapshot));
     }
 

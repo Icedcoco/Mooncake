@@ -96,6 +96,12 @@ class OpLogApplier {
     void ApplySegmentUnmount(const OpLogEntry& entry);
     void ApplySegmentUpdate(const OpLogEntry& entry);
 
+    /**
+     * @brief Load segment registry from snapshot baseline.
+     * Clears existing registry and replaces with given segments.
+     */
+    void LoadSegmentRegistry(const std::vector<StandbySegmentInfo>& segments);
+
    private:
     /**
      * @brief Check if the entry's sequence order is valid

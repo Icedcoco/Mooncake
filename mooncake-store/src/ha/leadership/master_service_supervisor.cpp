@@ -344,9 +344,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             server.init_ibv();
         }
 
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            mooncake::WrappedMasterServiceConfig(
-                config, leadership_session->view.view_version));
+        mooncake::WrappedMasterServiceConfig wrapped_config(
+            config, leadership_session->view.view_version);
+        // In HA serving-primary mode, snapshot bootstrap belongs to standby.
+        // The new primary must restore from PromotionContext only.
+        wrapped_config.enable_snapshot_restore = false;
+        auto wrapped_master_service =
+            std::make_shared<WrappedMasterService>(wrapped_config);
 
         // Restore from standby if we have context
         if (promotion_ctx->applied_seq_id > 0 ||

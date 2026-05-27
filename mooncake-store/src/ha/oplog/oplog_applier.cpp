@@ -581,6 +581,14 @@ const StandbySegmentRegistry& OpLogApplier::GetSegmentRegistry() const {
     return segment_registry_;
 }
 
+void OpLogApplier::LoadSegmentRegistry(
+    const std::vector<StandbySegmentInfo>& segments) {
+    segment_registry_.Clear();
+    for (const auto& seg : segments) {
+        segment_registry_.OnSegmentMount(seg);
+    }
+}
+
 void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     SegmentMountOp op;
     if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {

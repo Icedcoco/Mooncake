@@ -1686,6 +1686,11 @@ class MasterService {
     // Invalid endpoints from standby that don't exist locally
     std::unordered_set<std::string> invalid_replica_endpoints_;
 
+    // Keep DummyBufferAllocator alive after standby restore.
+    // Key: transport_endpoint, Value: allocator.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_allocator_keepalive_;
+
     // Pending mutation retry queue
     enum class PendingMutationKind : uint8_t {
         EVICT_MEM_REPLICAS = 1,

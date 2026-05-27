@@ -302,7 +302,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_ha_ && !cluster_id_.empty()) {
         auto store = OpLogStoreFactory::Create(
             config.oplog_store_type.empty()
-                ? OpLogStoreType::ETCD
+                ? kDefaultOpLogStoreType
                 : ParseOpLogStoreType(config.oplog_store_type),
             cluster_id_,
             OpLogStoreRole::WRITER,
@@ -601,6 +601,26 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     ErrorCode err = segment_access.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
+    }
+
+    // Publish SEGMENT_MOUNT OpLog for each remounted segment
+    if (enable_ha_ && oplog_store_) {
+        for (const auto& seg : segments) {
+            SegmentMountOp op;
+            op.segment_name = seg.name;
+            op.transport_endpoint = seg.te_endpoint;
+            op.capacity = seg.size;
+            op.is_memory_segment = true;
+            auto bytes = struct_pack::serialize(op);
+            auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::SEGMENT_MOUNT, seg.name,
+                std::string(bytes.begin(), bytes.end()));
+            if (!persist_result) {
+                LOG(WARNING) << "Failed to persist SEGMENT_MOUNT for segment="
+                             << seg.name;
+                // Continue with other segments; remount already succeeded locally
+            }
+        }
     }
 
     // Change the client status to OK
@@ -979,11 +999,10 @@ void MasterService::RestoreFromStandbySnapshot(
     oplog_manager_.SetInitialSequenceId(start_seq);
 
     // 2. Build allocator keepalive map for standby segments.
-    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
-        standby_allocs;
+    standby_allocator_keepalive_.clear();
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
-            standby_allocs[seg.transport_endpoint] =
+            standby_allocator_keepalive_[seg.transport_endpoint] =
                 std::make_shared<DummyBufferAllocator>(seg.segment_name,
                                                        seg.transport_endpoint);
         }
@@ -1002,8 +1021,8 @@ void MasterService::RestoreFromStandbySnapshot(
                 const auto& mem_desc = desc.get_memory_descriptor();
                 const std::string& endpoint =
                     mem_desc.buffer_descriptor.transport_endpoint_;
-                auto it = standby_allocs.find(endpoint);
-                if (it != standby_allocs.end()) {
+                auto it = standby_allocator_keepalive_.find(endpoint);
+                if (it != standby_allocator_keepalive_.end()) {
                     auto alloc = it->second;
                     replicas.emplace_back(
                         std::make_unique<AllocatedBuffer>(alloc, nullptr, 0),
@@ -1015,8 +1034,8 @@ void MasterService::RestoreFromStandbySnapshot(
                 const auto& nof_desc = desc.get_nof_descriptor();
                 const std::string& endpoint =
                     nof_desc.buffer_descriptor.transport_endpoint_;
-                auto it = standby_allocs.find(endpoint);
-                if (it != standby_allocs.end()) {
+                auto it = standby_allocator_keepalive_.find(endpoint);
+                if (it != standby_allocator_keepalive_.end()) {
                     auto alloc = it->second;
                     replicas.emplace_back(
                         std::make_unique<AllocatedBuffer>(alloc, nullptr, 0),
@@ -1285,8 +1304,27 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
+                    [&replica_list, this](const Replica& replica) {
+                        auto desc = replica.get_descriptor();
+                        // Filter invalid standby memory endpoints
+                        std::optional<std::string> endpoint;
+                        if (desc.is_memory_replica()) {
+                            endpoint = desc.get_memory_descriptor()
+                                           .buffer_descriptor
+                                           .transport_endpoint_;
+                        } else if (desc.is_nof_replica()) {
+                            endpoint = desc.get_nof_descriptor()
+                                           .buffer_descriptor
+                                           .transport_endpoint_;
+                        } else if (desc.is_local_disk_replica()) {
+                            endpoint =
+                                desc.get_local_disk_descriptor().transport_endpoint;
+                        }
+                        if (endpoint.has_value() &&
+                            invalid_replica_endpoints_.count(*endpoint) > 0) {
+                            return;
+                        }
+                        replica_list.emplace_back(std::move(desc));
                     });
 
                 if (replica_list.empty()) {

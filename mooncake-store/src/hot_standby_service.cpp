@@ -293,6 +293,10 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     for (const auto& kv : snapshot.metadata) {
         metadata_store_->PutMetadata(kv.first, kv.second);
     }
+    // Load segment registry from snapshot
+    if (oplog_applier_) {
+        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
+    }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
