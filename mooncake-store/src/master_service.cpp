@@ -428,6 +428,19 @@ MasterService::~MasterService() {
     }
 }
 
+void MasterService::SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store) {
+    oplog_store_ = std::move(store);
+    oplog_manager_.SetOpLogStore(oplog_store_);
+}
+
+void MasterService::SetOpLogRetryConfigForTesting(uint32_t max_attempts,
+                                                   uint32_t max_backoff_ms) {
+    oplog_retry_max_attempts_for_testing_.store(max_attempts,
+                                                std::memory_order_relaxed);
+    oplog_retry_max_backoff_ms_for_testing_.store(max_backoff_ms,
+                                                  std::memory_order_relaxed);
+}
+
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
     std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
@@ -652,10 +665,12 @@ void MasterService::ClearInvalidHandles(
                                                    std::memory_order_relaxed);
                 }
                 if (enable_ha_ && oplog_store_) {
-                    AppendOrPersistOrEnqueue(
-                        "ClearInvalidHandles(last replica REMOVE)",
-                        OpType::REMOVE, it->first, {},
-                        PendingMutationKind::CLEAR_ALL_REPLICAS);
+                    auto err = PersistRemoveForHA(
+                        "ClearInvalidHandles(last replica)", it->first);
+                    if (!err) {
+                        ++it;
+                        continue;
+                    }
                 }
                 it = shard->metadata.erase(it);
             } else {
@@ -665,11 +680,13 @@ void MasterService::ClearInvalidHandles(
                         return !r.is_memory_replica() ||
                                !r.has_invalid_mem_handle();
                     })) {
-                    AppendOrPersistOrEnqueue(
-                        "ClearInvalidHandles(has remaining replicas)",
+                    auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
                         OpType::PUT_END, it->first,
-                        SerializeMetadataForOpLogWithoutMemReplicas(it->second),
-                        PendingMutationKind::EVICT_MEM_REPLICAS);
+                        SerializeMetadataForOpLogWithoutMemReplicas(it->second));
+                    if (!persist_result) {
+                        ++it;
+                        continue;
+                    }
                 }
                 ++it;
             }
@@ -2651,6 +2668,13 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                if (enable_ha_ && oplog_store_) {
+                    auto err = PersistRemoveForHA("RemoveByRegex", it->first);
+                    if (!err) {
+                        ++it;
+                        continue;  // skip erase on persist failure
+                    }
+                }
                 ErasePromotionTaskIfPresent(shard, it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
@@ -2694,6 +2718,13 @@ long MasterService::RemoveAll(bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                if (enable_ha_ && oplog_store_) {
+                    auto err = PersistRemoveForHA("RemoveAll", it->first);
+                    if (!err) {
+                        ++it;
+                        continue;  // skip erase on persist failure
+                    }
+                }
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -2786,6 +2817,13 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Remove object metadata
+            if (enable_ha_ && oplog_store_) {
+                auto err = PersistRemoveForHA("BatchRemove", key);
+                if (!err) {
+                    results[original_idx] = tl::make_unexpected(err.error());
+                    continue;  // don't erase on persist failure
+                }
+            }
             shard->metadata.erase(it);
             results[original_idx] = {};  // Success
         }
@@ -3523,6 +3561,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
         const auto ttl =
             metadata.put_start_time + put_start_release_timeout_sec_;
         if (ttl < now) {
+            bool had_complete_replica = metadata.HasReplica(
+                [](const Replica& r) {
+                    return r.status() == ReplicaStatus::COMPLETE;
+                });
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
@@ -3531,7 +3573,23 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid()) {
                 // All replicas of this object are discarded, just
                 // remove the whole object.
+                if (had_complete_replica && enable_ha_ && oplog_store_) {
+                    auto err = PersistRemoveForHA(
+                        "DiscardExpiredProcessingReplicas", *key_it);
+                    if (!err) {
+                        key_it = shard->processing_keys.erase(key_it);
+                        continue;  // Don't erase on persist failure
+                    }
+                }
                 shard->metadata.erase(it);
+            } else if (had_complete_replica && enable_ha_ && oplog_store_) {
+                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    OpType::PUT_END, *key_it,
+                    SerializeMetadataForOpLogWithoutMemReplicas(metadata));
+                if (!persist_result) {
+                    key_it = shard->processing_keys.erase(key_it);
+                    continue;  // Don't modify metadata on persist failure
+                }
             }
 
             key_it = shard->processing_keys.erase(key_it);
@@ -3564,6 +3622,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         auto& metadata = metadata_it->second;
 
+        bool had_complete_replica = metadata.HasReplica(
+            [](const Replica& r) {
+                return r.status() == ReplicaStatus::COMPLETE;
+            });
+
         // Release source refcnt.
         auto source = metadata.GetReplicaByID(task_it->second.source_id);
         if (source != nullptr) {
@@ -3584,7 +3647,23 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         // Check whether the object is still valid.
         if (!metadata.IsValid()) {
+            if (had_complete_replica && enable_ha_ && oplog_store_) {
+                auto err = PersistRemoveForHA(
+                    "DiscardExpiredProcessingReplicas", task_it->first);
+                if (!err) {
+                    task_it = shard->replication_tasks.erase(task_it);
+                    continue;  // Don't erase on persist failure
+                }
+            }
             shard->metadata.erase(metadata_it);
+        } else if (had_complete_replica && enable_ha_ && oplog_store_) {
+            auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::PUT_END, task_it->first,
+                SerializeMetadataForOpLogWithoutMemReplicas(metadata));
+            if (!persist_result) {
+                task_it = shard->replication_tasks.erase(task_it);
+                continue;  // Don't modify metadata on persist failure
+            }
         }
 
         task_it = shard->replication_tasks.erase(task_it);
@@ -7006,9 +7085,14 @@ ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
                    << entry.sequence_id;
         return ErrorCode::INTERNAL_ERROR;
     }
+    const uint32_t max_attempts =
+        oplog_retry_max_attempts_for_testing_.load(std::memory_order_relaxed);
+    const uint32_t max_backoff_ms =
+        oplog_retry_max_backoff_ms_for_testing_.load(std::memory_order_relaxed);
     uint32_t attempt = 0;
     auto backoff = std::chrono::milliseconds(200);
-    while (attempt < 10) {
+    const auto max_backoff = std::chrono::milliseconds(max_backoff_ms);
+    while (attempt < max_attempts) {
         ErrorCode err = oplog_store_->WriteOpLog(entry, true);
         if (err == ErrorCode::OK) {
             return err;
@@ -7016,8 +7100,8 @@ ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
         HAMetricManager::instance().inc_oplog_etcd_write_retries();
         std::this_thread::sleep_for(backoff);
         backoff *= 2;
-        if (backoff > std::chrono::seconds(30)) {
-            backoff = std::chrono::seconds(30);
+        if (backoff > max_backoff) {
+            backoff = max_backoff;
         }
         ++attempt;
     }
@@ -7131,6 +7215,17 @@ tl::expected<OpLogEntry, ErrorCode> MasterService::AppendOpLogAndNotifyDurableOr
         return tl::unexpected(result);
     }
     return entry;
+}
+
+tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
+    const char* why, const std::string& key) {
+    auto result = AppendOpLogAndNotifyDurableOrAbort(OpType::REMOVE, key, {});
+    if (!result) {
+        LOG(WARNING) << why << ": REMOVE persist failed for key=" << key
+                   << ", err=" << static_cast<int>(result.error());
+        return tl::unexpected(result.error());
+    }
+    return {};
 }
 
 }  // namespace mooncake

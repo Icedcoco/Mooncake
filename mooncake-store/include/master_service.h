@@ -88,6 +88,18 @@ class MasterService {
         const UUID& segment_id);
 
     /**
+     * @brief Inject a mock OpLogStore for testing. Must be called before
+     *        any HA OpLog operations.
+     */
+    void SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
+
+    /**
+     * @brief Override retry behavior for OpLog persist in tests.
+     */
+    void SetOpLogRetryConfigForTesting(uint32_t max_attempts,
+                                       uint32_t max_backoff_ms);
+
+    /**
      * @brief Mount a memory segment for buffer allocation. This function is
      * idempotent.
      * @return ErrorCode::OK on success,
@@ -1707,12 +1719,23 @@ class MasterService {
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
         OpType type, const std::string& key, const std::string& payload);
 
+    /**
+     * Helper to persist REMOVE OpLog for a key with strong-consistency.
+     * @return OK on success, error on persist failure (caller must skip erase)
+     */
+    tl::expected<void, ErrorCode> PersistRemoveForHA(
+        const char* why, const std::string& key);
+
     std::mutex pending_mutations_mutex_;
     std::condition_variable pending_mutations_cv_;
     std::deque<PendingMutation> pending_mutations_;
     std::atomic<bool> pending_mutations_running_{false};
     std::thread pending_mutations_thread_;
     static constexpr size_t kMaxPendingMutations = 10000;
+
+    // Test-only overrides for PersistOpLogEntryWithSyncRetries
+    std::atomic<uint32_t> oplog_retry_max_attempts_for_testing_{10};
+    std::atomic<uint32_t> oplog_retry_max_backoff_ms_for_testing_{30000};
 };
 
 }  // namespace mooncake
