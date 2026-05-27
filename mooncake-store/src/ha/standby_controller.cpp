@@ -214,16 +214,30 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     }
 
     tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport() override {
-        // First promote (same as old PromoteStandby)
-        ErrorCode err = PromoteStandby();
-        if (err != ErrorCode::OK) {
-            return tl::unexpected(err);
+        // Verify standby is running first (same check as PromoteStandby)
+        ErrorCode promote_error = ErrorCode::OK;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!standby_running_) {
+                promote_error = last_standby_error_ != ErrorCode::OK
+                                    ? last_standby_error_
+                                    : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
+        }
+        if (promote_error != ErrorCode::OK) {
+            return tl::unexpected(promote_error);
         }
 
-        // Then export snapshot
+        // Export snapshot while service is still running
         StandbySnapshot snapshot;
         if (!standby_service_->ExportStandbySnapshot(snapshot)) {
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // Then promote (stops the service)
+        ErrorCode err = PromoteStandby();
+        if (err != ErrorCode::OK) {
+            return tl::unexpected(err);
         }
 
         PromotionContext ctx;
