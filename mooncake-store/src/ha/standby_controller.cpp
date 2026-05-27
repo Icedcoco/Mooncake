@@ -78,6 +78,10 @@ class NoopStandbyController final : public StandbyController {
 
     ErrorCode PromoteStandby() override { return ErrorCode::OK; }
 
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport() override {
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     void UpdateObservedLeader(const std::optional<MasterView>&) override {}
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
@@ -207,6 +211,27 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         NotifyRuntimeStateIfChanged();
         return err;
+    }
+
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport() override {
+        // First promote (same as old PromoteStandby)
+        ErrorCode err = PromoteStandby();
+        if (err != ErrorCode::OK) {
+            return tl::unexpected(err);
+        }
+
+        // Then export snapshot
+        StandbySnapshot snapshot;
+        if (!standby_service_->ExportStandbySnapshot(snapshot)) {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        PromotionContext ctx;
+        ctx.applied_seq_id = snapshot.oplog_sequence_id;
+        ctx.objects = std::move(snapshot.objects);
+        ctx.segments = std::move(snapshot.segments);
+
+        return ctx;
     }
 
     void UpdateObservedLeader(
