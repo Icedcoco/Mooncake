@@ -1693,12 +1693,19 @@ class MasterService {
     void EnqueuePendingMutation(PendingMutation m);
     void PendingMutationWorker();
     bool ProcessPendingMutationOnce(PendingMutation& m);
-    void EnqueueRetryOnPersistFailure(const char* why, OpType type, const std::string& key,
-                                      const std::string& payload, PendingMutationKind kind);
+    void EnqueueRetryOnPersistFailure(const char* why, PendingMutationKind kind,
+                                      OpLogEntry entry);
     void AppendOrPersistOrEnqueue(const char* why, OpType type, const std::string& key,
                                  const std::string& payload, PendingMutationKind kind);
     void AppendOrPersistOrEnqueueLazy(const char* why, OpType type, const std::string& key,
                                      const std::string& payload, PendingMutationKind kind);
+
+    /**
+     * Strong-consistency variant: if OpLog persist fails, returns error.
+     * Caller must NOT proceed with local mutation if this returns error.
+     */
+    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
+        OpType type, const std::string& key, const std::string& payload);
 
     std::mutex pending_mutations_mutex_;
     std::condition_variable pending_mutations_cv_;

@@ -228,17 +228,25 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return tl::unexpected(promote_error);
         }
 
-        // Export snapshot while service is still running
+        // Atomic promote + export (final catch-up happens inside)
         StandbySnapshot snapshot;
-        if (!standby_service_->ExportStandbySnapshot(snapshot)) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-
-        // Then promote (stops the service)
-        ErrorCode err = PromoteStandby();
+        ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
         if (err != ErrorCode::OK) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                standby_running_ = false;
+                last_standby_error_ = err;
+            }
+            NotifyRuntimeStateIfChanged();
             return tl::unexpected(err);
         }
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running_ = false;
+            last_standby_error_ = ErrorCode::OK;
+        }
+        NotifyRuntimeStateIfChanged();
 
         PromotionContext ctx;
         ctx.applied_seq_id = snapshot.oplog_sequence_id;

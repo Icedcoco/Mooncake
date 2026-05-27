@@ -725,6 +725,17 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     // 2. Remove the metadata of the related objects
     ClearInvalidHandles();
 
+    // Cache endpoint before commit removes segment from registry
+    std::string segment_name;
+    std::string te_endpoint;
+    {
+        ScopedSegmentAccess info_access = segment_manager_.getSegmentAccess();
+        if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
+                                                   te_endpoint)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+    }
+
     // 3. Commit the unmount operation
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
@@ -733,15 +744,17 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         return tl::make_unexpected(err);
     }
 
-    // Publish SEGMENT_UNMOUNT OpLog for HA
-    if (enable_ha_ && oplog_store_) {
-        std::string segment_name;
-        std::string te_endpoint;
-        segment_manager_.GetSegmentBasicInfo(segment_id, segment_name, te_endpoint);
+    // Publish SEGMENT_UNMOUNT OpLog for HA after successful commit
+    if (enable_ha_ && oplog_store_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        AppendOpLogAndNotify(OpType::SEGMENT_UNMOUNT, te_endpoint,
-                             std::string(bytes.begin(), bytes.end()));
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::SEGMENT_UNMOUNT, te_endpoint,
+            std::string(bytes.begin(), bytes.end()));
+        if (!persist_result) {
+            LOG(ERROR) << "Failed to persist SEGMENT_UNMOUNT for endpoint="
+                       << te_endpoint;
+        }
     }
 
     return {};
@@ -1141,9 +1154,11 @@ auto MasterService::BatchReplicaClear(
 
             // Erase the entire metadata (all replicas will be deallocated)
             if (enable_ha_ && oplog_store_) {
-                AppendOrPersistOrEnqueue("BatchReplicaClear(clear_all)",
-                                         OpType::REMOVE, key, {},
-                                         PendingMutationKind::CLEAR_ALL_REPLICAS);
+                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    OpType::REMOVE, key, {});
+                if (!persist_result) {
+                    continue;  // skip this key on persist failure
+                }
             }
             accessor.Erase();
             cleared_keys.emplace_back(key);
@@ -1195,17 +1210,19 @@ auto MasterService::BatchReplicaClear(
                                (!r.is_memory_replica() ||
                                 !r.has_invalid_mem_handle());
                     });
-                if (!will_have_valid_replicas) {
-                    AppendOrPersistOrEnqueue(
-                        "BatchReplicaClear(segment, last replica)",
-                        OpType::REMOVE, key, {},
-                        PendingMutationKind::CLEAR_ALL_REPLICAS);
-                } else {
-                    AppendOrPersistOrEnqueue(
-                        "BatchReplicaClear(segment, has remaining)",
-                        OpType::PUT_END, key,
-                        SerializeMetadataForOpLogWithoutMemReplicas(metadata),
-                        PendingMutationKind::EVICT_MEM_REPLICAS);
+                if (enable_ha_ && oplog_store_) {
+                    tl::expected<OpLogEntry, ErrorCode> persist_result;
+                    if (!will_have_valid_replicas) {
+                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                            OpType::REMOVE, key, {});
+                    } else {
+                        persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                            OpType::PUT_END, key,
+                            SerializeMetadataForOpLogWithoutMemReplicas(metadata));
+                    }
+                    if (!persist_result) {
+                        continue;  // skip this key on persist failure
+                    }
                 }
             }
 
@@ -1742,8 +1759,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (enable_ha_ && oplog_store_) {
-        AppendOrPersistOrEnqueue("PutRevoke", OpType::PUT_REVOKE, key, {},
-                                 PendingMutationKind::EVICT_MEM_REPLICAS);
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::PUT_REVOKE, key, {});
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
     }
 
     metadata.EraseReplicas([replica_type](const Replica& replica) {
@@ -2570,8 +2590,11 @@ auto MasterService::Remove(const std::string& key, bool force)
 
     // Remove object metadata
     if (enable_ha_ && oplog_store_) {
-        AppendOrPersistOrEnqueue("Remove", OpType::REMOVE, key, {},
-                                 PendingMutationKind::CLEAR_ALL_REPLICAS);
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::REMOVE, key, {});
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
     }
     accessor.Erase();
     ErasePromotionTaskIfPresent(accessor.GetShard(), key);
@@ -6978,6 +7001,11 @@ tl::expected<uint64_t, ErrorCode> MasterService::AppendOpLogAndNotifyDurable(
 
 ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
     const OpLogEntry& entry) const {
+    if (!oplog_store_) {
+        LOG(ERROR) << "OpLogStore not available, cannot persist entry seq="
+                   << entry.sequence_id;
+        return ErrorCode::INTERNAL_ERROR;
+    }
     uint32_t attempt = 0;
     auto backoff = std::chrono::milliseconds(200);
     while (attempt < 10) {
@@ -7061,15 +7089,16 @@ bool MasterService::ProcessPendingMutationOnce(PendingMutation& m) {
     return true;
 }
 
-void MasterService::EnqueueRetryOnPersistFailure(const char* why, OpType type, const std::string& key,
-                                                 const std::string& payload, PendingMutationKind kind) {
-    LOG(WARNING) << why << " for key: " << key << ", enqueueing for retry";
-    OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+void MasterService::EnqueueRetryOnPersistFailure(
+    const char* why, PendingMutationKind kind, OpLogEntry entry) {
+    LOG(WARNING) << why << " for key=" << entry.object_key
+                 << ", sequence_id=" << entry.sequence_id
+                 << ", enqueueing for retry";
     PendingMutation m;
     m.kind = kind;
-    m.key = key;
+    m.key = entry.object_key;
     m.segment_name = "";
-    m.oplog_entry = entry;
+    m.oplog_entry = std::move(entry);
     m.attempt = 0;
     m.next_retry_at = std::chrono::steady_clock::now();
     EnqueuePendingMutation(std::move(m));
@@ -7077,16 +7106,31 @@ void MasterService::EnqueueRetryOnPersistFailure(const char* why, OpType type, c
 
 void MasterService::AppendOrPersistOrEnqueue(const char* why, OpType type, const std::string& key,
                                              const std::string& payload, PendingMutationKind kind) {
-    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
     auto result = PersistOpLogEntryWithSyncRetries(entry);
     if (result != ErrorCode::OK) {
-        EnqueueRetryOnPersistFailure(why, type, key, payload, kind);
+        EnqueueRetryOnPersistFailure(why, kind, std::move(entry));
     }
 }
 
 void MasterService::AppendOrPersistOrEnqueueLazy(const char* why, OpType type, const std::string& key,
                                                   const std::string& payload, PendingMutationKind kind) {
     AppendOrPersistOrEnqueue(why, type, key, payload, kind);
+}
+
+tl::expected<OpLogEntry, ErrorCode> MasterService::AppendOpLogAndNotifyDurableOrAbort(
+    OpType type, const std::string& key, const std::string& payload) {
+    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    auto result = PersistOpLogEntryWithSyncRetries(entry);
+    if (result != ErrorCode::OK) {
+        LOG(ERROR) << "OpLog persist failed for key=" << key
+                   << ", type=" << static_cast<int>(type)
+                   << ", seq=" << entry.sequence_id
+                   << ", err=" << static_cast<int>(result)
+                   << ", aborting mutation";
+        return tl::unexpected(result);
+    }
+    return entry;
 }
 
 }  // namespace mooncake

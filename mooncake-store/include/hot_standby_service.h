@@ -128,6 +128,17 @@ class HotStandbyService {
     ErrorCode Promote();
 
     /**
+     * @brief Promote this standby to Primary and export a snapshot atomically.
+     *
+     * Holds mutex_ through the entire promotion + export process, ensuring
+     * the snapshot is captured before any state is released.
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
+
+    /**
      * @brief Get the number of metadata entries in the local store
      */
     size_t GetMetadataCount() const;
