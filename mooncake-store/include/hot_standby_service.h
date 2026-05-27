@@ -148,6 +148,17 @@ class HotStandbyService {
     bool ExportMetadataSnapshot(
         std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
 
+    /**
+     * Export complete standby snapshot including:
+     * - Applied OpLog sequence ID
+     * - All object metadata
+     * - All registered segments (via OpLogApplier's segment registry)
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return true on success, false on failure (e.g., service not running)
+     */
+    bool ExportStandbySnapshot(StandbySnapshot& out) const;
+
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 

@@ -658,6 +658,32 @@ bool HotStandbyService::ExportMetadataSnapshot(
     return true;
 }
 
+bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsRunning()) {
+        return false;
+    }
+
+    // Get applied sequence ID
+    out.oplog_sequence_id = GetLatestAppliedSequenceId();
+
+    // Export object metadata
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+
+    // Export segments from OpLogApplier's registry (Patch B)
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
+    return true;
+}
+
 void HotStandbyService::SetSnapshotProvider(
     std::unique_ptr<SnapshotProvider> provider) {
     std::lock_guard<std::mutex> lock(mutex_);
