@@ -1708,6 +1708,7 @@ class MasterService {
         EVICT_MEM_REPLICAS = 1,
         CLEAR_ALL_REPLICAS = 2,
         CLEAR_REPLICAS_ON_SEGMENT = 3,
+        SEGMENT_LIFECYCLE = 4,
     };
 
     struct PendingMutation {
@@ -1735,6 +1736,18 @@ class MasterService {
      */
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
         OpType type, const std::string& key, const std::string& payload);
+
+    /**
+     * Segment lifecycle persist helper. Tries to durably persist the
+     * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
+     * the same OpLogEntry (with its already-allocated sequence_id) for
+     * background retry so the standby segment registry eventually
+     * converges. Suitable for paths where the local segment commit has
+     * already happened (UnmountSegment) and rolling back is impossible.
+     */
+    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                         const std::string& key,
+                                         const std::string& payload);
 
     /**
      * Helper to persist REMOVE OpLog for a key with strong-consistency.

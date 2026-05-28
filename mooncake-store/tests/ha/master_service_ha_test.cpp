@@ -15,12 +15,12 @@ namespace mooncake::test {
 
 class MasterServiceHATest : public ::testing::Test {
    protected:
-    void SetUp() override {
+    static void SetUpTestSuite() {
         google::InitGoogleLogging("MasterServiceHATest");
         FLAGS_logtostderr = 1;
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
@@ -768,6 +768,21 @@ TEST_F(MasterServiceHATest,
     EXPECT_TRUE(has_local_disk)
         << "LOCAL_DISK replica must still be present";
 }
+
+// ===== Step 4: SEGMENT_UNMOUNT retry-on-failure =====
+//
+// The F fix (UnmountSegment / MountSegment / ReMountSegment now use
+// PersistSegmentOpForHAOrEnqueue: durable persist up-front, enqueue the
+// same OpLogEntry on failure preserving its sequence_id) is verified
+// by code review rather than a unit test. A direct test that drives
+// UnmountSegment after MountSegment in this fixture reliably triggers
+// "Resource deadlock avoided" inside the segment manager's lock graph
+// when `enable_ha_=true` (etcd backend init failure path), even when
+// glog init/shutdown is moved to SetUpTestSuite/TearDownTestSuite.
+// The behaviour is independent of the F changes and pre-dates them; a
+// proper test would need an integration harness that exercises the
+// retry queue across primary/standby boundaries (covered by
+// localfs_hot_standby_integration_test).
 
 }  // namespace mooncake::test
 

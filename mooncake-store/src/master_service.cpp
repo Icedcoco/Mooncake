@@ -533,7 +533,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         return tl::make_unexpected(err);
     }
 
-    // Publish SEGMENT_MOUNT OpLog for HA
+    // Publish SEGMENT_MOUNT OpLog for HA. Local mount already succeeded;
+    // on persist failure enqueue retry (preserving sequence_id) so the
+    // standby registry eventually sees the new segment.
     if (enable_ha_ && oplog_store_) {
         SegmentMountOp op;
         op.segment_name = segment.name;
@@ -542,8 +544,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.is_memory_segment = true;  // based on actual segment type
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
-        AppendOpLogAndNotify(OpType::SEGMENT_MOUNT, segment.te_endpoint,
-                             std::string(bytes.begin(), bytes.end()));
+        PersistSegmentOpForHAOrEnqueue(
+            "MountSegment", OpType::SEGMENT_MOUNT, segment.te_endpoint,
+            std::string(bytes.begin(), bytes.end()));
     }
 
     return {};
@@ -613,7 +616,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         return tl::make_unexpected(err);
     }
 
-    // Publish SEGMENT_MOUNT OpLog for each remounted segment
+    // Publish SEGMENT_MOUNT OpLog for each remounted segment. Local
+    // remount already succeeded; on persist failure each entry is
+    // enqueued for retry preserving its sequence_id.
     if (enable_ha_ && oplog_store_) {
         for (const auto& seg : segments) {
             SegmentMountOp op;
@@ -622,14 +627,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.capacity = seg.size;
             op.is_memory_segment = true;
             auto bytes = struct_pack::serialize(op);
-            auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::SEGMENT_MOUNT, seg.name,
+            PersistSegmentOpForHAOrEnqueue(
+                "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
                 std::string(bytes.begin(), bytes.end()));
-            if (!persist_result) {
-                LOG(WARNING) << "Failed to persist SEGMENT_MOUNT for segment="
-                             << seg.name;
-                // Continue with other segments; remount already succeeded locally
-            }
         }
     }
 
@@ -791,17 +791,16 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         return tl::make_unexpected(err);
     }
 
-    // Publish SEGMENT_UNMOUNT OpLog for HA after successful commit
+    // Publish SEGMENT_UNMOUNT OpLog for HA after successful commit. The
+    // local unmount is already committed, so on persist failure we
+    // enqueue the same OpLogEntry (preserving sequence_id) for retry —
+    // dropping the standby update is not acceptable.
     if (enable_ha_ && oplog_store_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::SEGMENT_UNMOUNT, te_endpoint,
+        PersistSegmentOpForHAOrEnqueue(
+            "UnmountSegment", OpType::SEGMENT_UNMOUNT, te_endpoint,
             std::string(bytes.begin(), bytes.end()));
-        if (!persist_result) {
-            LOG(ERROR) << "Failed to persist SEGMENT_UNMOUNT for endpoint="
-                       << te_endpoint;
-        }
     }
 
     return {};
@@ -7579,6 +7578,26 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
         return tl::unexpected(result.error());
     }
     return {};
+}
+
+void MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const std::string& key,
+    const std::string& payload) {
+    // Allocate the entry up-front so the retry queue and the up-front
+    // attempt share the same sequence_id — standby applies idempotent
+    // segment events but the seq must be monotonic.
+    OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    auto result = PersistOpLogEntryWithSyncRetries(entry);
+    if (result == ErrorCode::OK) {
+        return;
+    }
+    LOG(WARNING) << why << ": segment OpLog persist failed for key=" << key
+                 << ", type=" << static_cast<int>(type)
+                 << ", seq=" << entry.sequence_id
+                 << ", err=" << static_cast<int>(result)
+                 << "; enqueueing for retry";
+    EnqueueRetryOnPersistFailure(why, PendingMutationKind::SEGMENT_LIFECYCLE,
+                                 std::move(entry));
 }
 
 std::vector<Replica::Descriptor>
