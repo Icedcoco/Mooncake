@@ -1746,7 +1746,50 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+    const bool replacing_existing =
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+
+    // HA strong consistency: build the post-mutation replica descriptor list
+    // and persist OpLog BEFORE applying the local mutation. If persist fails,
+    // metadata stays untouched.
+    if (enable_ha_ && oplog_store_) {
+        std::vector<Replica::Descriptor> post;
+        for (const auto& existing : metadata.GetAllReplicas()) {
+            if (existing.status() != ReplicaStatus::COMPLETE) continue;
+            if (replacing_existing && existing.type() == ReplicaType::LOCAL_DISK &&
+                existing.get_descriptor()
+                        .get_local_disk_descriptor()
+                        .client_id == client_id) {
+                // Substitute with the updated descriptor.
+                Replica::Descriptor updated = existing.get_descriptor();
+                updated.get_local_disk_descriptor().transport_endpoint =
+                    replica.get_descriptor()
+                        .get_local_disk_descriptor()
+                        .transport_endpoint;
+                updated.get_local_disk_descriptor().object_size =
+                    replica.get_descriptor()
+                        .get_local_disk_descriptor()
+                        .object_size;
+                post.push_back(std::move(updated));
+            } else {
+                post.push_back(existing.get_descriptor());
+            }
+        }
+        if (!replacing_existing) {
+            // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
+            post.push_back(replica.get_descriptor());
+        }
+
+        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+            OpType::PUT_END, key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(
+                metadata.client_id, metadata.size, post));
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
+    }
+
+    if (!replacing_existing) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
@@ -1769,18 +1812,6 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                         .get_local_disk_descriptor()
                         .object_size;
             });
-    }
-
-    if (enable_ha_ && oplog_store_) {
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, [](const Replica&) { return false; });
-        auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::PUT_END, key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, remaining));
-        if (!persist_result) {
-            LOG(ERROR) << "AddReplica: OpLog persist failed for key=" << key;
-        }
     }
 
     return {};
@@ -1817,13 +1848,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
-    if (replica_type == ReplicaType::MEMORY ||
-        (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().dec_file_cache_nums();
-    }
-
     if (enable_ha_ && oplog_store_) {
         auto remaining = BuildRemainingReplicaDescriptors(
             metadata,
@@ -1847,6 +1871,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
+    }
+
+    // Persist OK — apply local mutation and metric updates together.
+    if (replica_type == ReplicaType::MEMORY ||
+        (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
+        MasterMetricManager::instance().dec_mem_cache_nums();
+    } else if (replica_type == ReplicaType::DISK) {
+        MasterMetricManager::instance().dec_file_cache_nums();
     }
 
     metadata.EraseReplicas([replica_type](const Replica& replica) {
@@ -2363,11 +2395,14 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
-    // Decrement source reference count
-    source->dec_refcnt();
+    // Decrement source reference count is deferred until after persist.
 
-    // Mark all replica_ids as complete
+    // First validate that all target replicas are still healthy. If any
+    // replica is invalid we won't be able to mark it complete; this affects
+    // the post-mutation descriptor list.
     bool all_complete = true;
+    std::vector<ReplicaID> commit_target_ids;
+    commit_target_ids.reserve(task.replica_ids.size());
     for (const auto& replica_id : task.replica_ids) {
         auto replica = metadata.GetReplicaByID(replica_id);
         if (replica == nullptr || replica->has_invalid_mem_handle()) {
@@ -2376,21 +2411,42 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                 << ", copy target becomes invalid during data transfer";
             all_complete = false;
         } else {
-            replica->mark_complete();
+            commit_target_ids.push_back(replica_id);
         }
     }
 
     if (enable_ha_ && oplog_store_) {
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, [](const Replica&) { return false; });
+        // Build post-mutation descriptors: existing COMPLETE replicas plus
+        // the targets that are about to be marked COMPLETE.
+        std::vector<Replica::Descriptor> post;
+        for (const auto& rep : metadata.GetAllReplicas()) {
+            if (rep.status() == ReplicaStatus::COMPLETE) {
+                post.push_back(rep.get_descriptor());
+                continue;
+            }
+            if (std::find(commit_target_ids.begin(), commit_target_ids.end(),
+                          rep.id()) != commit_target_ids.end()) {
+                Replica::Descriptor desc = rep.get_descriptor();
+                desc.status = ReplicaStatus::COMPLETE;
+                post.push_back(std::move(desc));
+            }
+        }
 
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::PUT_END, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, remaining));
+                metadata.client_id, metadata.size, post));
         if (!persist_result) {
-            LOG(ERROR) << "CopyEnd: OpLog persist failed for key=" << key;
-            // Copy completed locally but standby won't see new replica.
+            return tl::make_unexpected(persist_result.error());
+        }
+    }
+
+    // Persist OK — apply local commit.
+    source->dec_refcnt();
+    for (const auto& replica_id : commit_target_ids) {
+        auto replica = metadata.GetReplicaByID(replica_id);
+        if (replica != nullptr) {
+            replica->mark_complete();
         }
     }
 
@@ -2592,41 +2648,55 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
-    // Decrement source reference count
-    source->dec_refcnt();
-
-    // If the move target has already existed on MoveStart, task.replica_ids
-    // will be empty. Thus we need to check whether we have replica_ids to
-    // process.
-    if (!task.replica_ids.empty()) {
-        auto replica_id = task.replica_ids[0];
-        auto replica = metadata.GetReplicaByID(replica_id);
+    // Validate the target replica before any mutation. Source dec_refcnt
+    // and target mark_complete are deferred until after persist.
+    bool has_target = !task.replica_ids.empty();
+    ReplicaID target_id = has_target ? task.replica_ids[0] : ReplicaID{};
+    if (has_target) {
+        auto replica = metadata.GetReplicaByID(target_id);
         if (replica == nullptr || replica->has_invalid_mem_handle()) {
             LOG(WARNING)
-                << "key=" << key << ", replica_id=" << replica_id
+                << "key=" << key << ", replica_id=" << target_id
                 << ", move target becomes invalid during data transfer";
+            // Source untouched; safe to drop the broken task.
             accessor.EraseReplicationTask();
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
-
-        // Mark replica as complete
-        replica->mark_complete();
     }
 
     if (enable_ha_ && oplog_store_) {
-        // After move: target is complete, source is gone
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata,
-            [&source_id](const Replica& r) {
-                return r.id() == source_id;
-            });
+        // Build post-mutation descriptors:
+        //   - existing COMPLETE replicas, except the source (about to be popped)
+        //   - target (if any) flipped to COMPLETE
+        std::vector<Replica::Descriptor> post;
+        for (const auto& rep : metadata.GetAllReplicas()) {
+            if (rep.id() == source_id) continue;
+            if (rep.status() == ReplicaStatus::COMPLETE) {
+                post.push_back(rep.get_descriptor());
+                continue;
+            }
+            if (has_target && rep.id() == target_id) {
+                Replica::Descriptor desc = rep.get_descriptor();
+                desc.status = ReplicaStatus::COMPLETE;
+                post.push_back(std::move(desc));
+            }
+        }
 
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::PUT_END, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, remaining));
+                metadata.client_id, metadata.size, post));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
+        }
+    }
+
+    // Persist OK — apply local commit.
+    source->dec_refcnt();
+    if (has_target) {
+        auto replica = metadata.GetReplicaByID(target_id);
+        if (replica != nullptr) {
+            replica->mark_complete();
         }
     }
 
@@ -3498,27 +3568,46 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    bool committed = false;
+    // Locate the staged replica without mutating it. mark_complete is
+    // deferred until after persist.
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
-    if (staged != nullptr && staged->is_memory_replica() &&
-        staged->is_processing()) {
-        staged->mark_complete();
-        committed = true;
+    const bool stage_ready = staged != nullptr &&
+                              staged->is_memory_replica() &&
+                              staged->is_processing();
+    if (!stage_ready) {
+        // Nothing to commit — keep task/promotion_in_flight intact and let
+        // the caller see REPLICA_IS_NOT_READY (mirrors the previous
+        // behavior when committed=false).
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    if (committed && enable_ha_ && oplog_store_) {
-        auto remaining = BuildRemainingReplicaDescriptors(
-            metadata, [](const Replica&) { return false; });
+    if (enable_ha_ && oplog_store_) {
+        // Build post-mutation descriptors: existing COMPLETE replicas plus
+        // the staged replica flipped to COMPLETE.
+        std::vector<Replica::Descriptor> post;
+        for (const auto& rep : metadata.GetAllReplicas()) {
+            if (rep.id() == task_it->second.alloc_id) {
+                Replica::Descriptor desc = rep.get_descriptor();
+                desc.status = ReplicaStatus::COMPLETE;
+                post.push_back(std::move(desc));
+            } else if (rep.status() == ReplicaStatus::COMPLETE) {
+                post.push_back(rep.get_descriptor());
+            }
+        }
 
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::PUT_END, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, remaining));
+                metadata.client_id, metadata.size, post));
         if (!persist_result) {
-            LOG(ERROR) << "NotifyPromotionSuccess: OpLog persist failed for key="
-                       << key;
+            // Keep staged replica PROCESSING and task untouched. Caller
+            // can retry; promotion_in_flight remains accurate.
+            return tl::make_unexpected(persist_result.error());
         }
     }
+
+    // Persist OK — apply local commit.
+    staged->mark_complete();
 
     // Drop the source LOCAL_DISK replica's refcnt and erase the task.
     auto* source = metadata.GetReplicaByID(task_it->second.source_id);
@@ -3542,9 +3631,6 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         }
     }
 
-    if (!committed) {
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-    }
     return {};
 }
 

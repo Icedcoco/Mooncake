@@ -426,6 +426,176 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(entry.payload.empty());
 }
 
+// ===== Step 1: persist-before-local-commit for replica mutations =====
+
+// AddReplica must NOT add the LOCAL_DISK descriptor when OpLog persist fails.
+TEST_F(MasterServiceHATest, AddReplicaPersistFailureSkipsLocalMutation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "add_replica_persist_fail_key";
+    PutObject(*service, client_id, key);
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    auto add_res = service->AddReplica(client_id, key, local_disk_replica);
+    EXPECT_FALSE(add_res.has_value())
+        << "AddReplica must return error when OpLog persist fails";
+
+    // The LOCAL_DISK descriptor must NOT be visible in metadata.
+    auto list = service->GetReplicaList(key);
+    ASSERT_TRUE(list.has_value());
+    for (const auto& desc : list->replicas) {
+        EXPECT_FALSE(desc.is_local_disk_replica())
+            << "LOCAL_DISK replica must not be present after persist failure";
+    }
+}
+
+// CopyEnd must NOT mark target replicas COMPLETE or erase the task when
+// OpLog persist fails.
+TEST_F(MasterServiceHATest, CopyEndPersistFailureSkipsLocalMutation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    const std::string key = "copy_end_persist_fail_key";
+    const UUID client_id = generate_uuid();
+    PutObjectOnSegment(*service, client_id, key, "seg1");
+
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    auto copy_start = service->CopyStart(client_id, key, "seg1", {"seg2"});
+    ASSERT_TRUE(copy_start.has_value());
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    auto res = service->CopyEnd(client_id, key);
+    EXPECT_FALSE(res.has_value())
+        << "CopyEnd must return error when OpLog persist fails";
+
+    // Target replicas must remain PROCESSING (not COMPLETE).
+    auto list = service->GetReplicaList(key);
+    ASSERT_TRUE(list.has_value());
+    // Only the original COMPLETE memory replica should be in the published
+    // descriptor list — target replicas are still PROCESSING and excluded.
+    EXPECT_EQ(1u, list->replicas.size())
+        << "Only the original source replica should be COMPLETE";
+
+    // Retrying after restoring persist should succeed.
+    mock_store->SetWriteError(ErrorCode::OK);
+    auto retry = service->CopyEnd(client_id, key);
+    EXPECT_TRUE(retry.has_value())
+        << "CopyEnd retry should succeed after persist is restored";
+}
+
+// MoveEnd must NOT decrement source refcnt or mark target COMPLETE when
+// OpLog persist fails.
+TEST_F(MasterServiceHATest, MoveEndPersistFailureSkipsLocalMutation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    PrepareSimpleSegment(*service, "seg1", kDefaultSegmentBase);
+    const std::string key = "move_end_persist_fail_key";
+    const UUID client_id = generate_uuid();
+    PutObjectOnSegment(*service, client_id, key, "seg1");
+
+    PrepareSimpleSegment(*service, "seg2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    auto move_start = service->MoveStart(client_id, key, "seg1", "seg2");
+    ASSERT_TRUE(move_start.has_value());
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    auto res = service->MoveEnd(client_id, key);
+    EXPECT_FALSE(res.has_value())
+        << "MoveEnd must return error when OpLog persist fails";
+
+    // Source must still be COMPLETE and present (PopReplicas was not called),
+    // and target must still be PROCESSING (mark_complete was not called).
+    // The visible descriptor list contains only COMPLETE replicas; therefore
+    // exactly the original source descriptor should appear.
+    auto list = service->GetReplicaList(key);
+    ASSERT_TRUE(list.has_value());
+    EXPECT_EQ(1u, list->replicas.size())
+        << "Source must still be present and target still PROCESSING";
+
+    // Retrying after restoring persist should succeed.
+    mock_store->SetWriteError(ErrorCode::OK);
+    auto retry = service->MoveEnd(client_id, key);
+    EXPECT_TRUE(retry.has_value())
+        << "MoveEnd retry should succeed after persist is restored";
+}
+
+// PutRevoke must NOT mutate metadata when OpLog persist fails (also
+// implicitly checks H.1 metric ordering: dec_mem_cache_nums must not run
+// when persist fails). The PROCESSING replica should still be revokable
+// after we restore persist.
+TEST_F(MasterServiceHATest, PutRevokePersistFailureSkipsLocalMutation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "put_revoke_persist_fail_key";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start = service->PutStart(client_id, key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    auto res = service->PutRevoke(client_id, key, ReplicaType::MEMORY);
+    EXPECT_FALSE(res.has_value())
+        << "PutRevoke must return error when OpLog persist fails";
+
+    // Restore persist; PutRevoke must succeed because the PROCESSING replica
+    // was NOT erased on the failed attempt.
+    mock_store->SetWriteError(ErrorCode::OK);
+    auto retry = service->PutRevoke(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(retry.has_value())
+        << "PutRevoke retry must succeed because the PROCESSING replica "
+           "was preserved after persist failure";
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
