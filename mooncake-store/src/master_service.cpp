@@ -1189,6 +1189,17 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
+            // HA strong consistency: persist BEFORE mutating local state
+            // (metric counters + accessor.Erase). On persist failure
+            // metrics + metadata both stay unchanged.
+            if (enable_ha_ && oplog_store_) {
+                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    OpType::REMOVE, key, {});
+                if (!persist_result) {
+                    continue;  // skip this key on persist failure
+                }
+            }
+
             metadata.VisitReplicas(
                 &Replica::fn_is_completed, [](Replica& replica) {
                     if (replica.is_memory_replica()) {
@@ -1198,14 +1209,7 @@ auto MasterService::BatchReplicaClear(
                     }
                 });
 
-            // Erase the entire metadata (all replicas will be deallocated)
-            if (enable_ha_ && oplog_store_) {
-                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                    OpType::REMOVE, key, {});
-                if (!persist_result) {
-                    continue;  // skip this key on persist failure
-                }
-            }
+            // Erase the entire metadata (all replicas will be deallocated).
             accessor.Erase();
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
@@ -1213,7 +1217,6 @@ auto MasterService::BatchReplicaClear(
                     << key << " for client_id=" << client_id;
         } else {
             // Clear only replicas on the specified segment_name
-            bool has_replica_on_segment = false;
             const auto match_replica_on_segment =
                 [&](const Replica& replica) -> bool {
                 if (!replica.is_completed()) {
@@ -1229,17 +1232,9 @@ auto MasterService::BatchReplicaClear(
                 return false;
             };
 
-            metadata.VisitReplicas(
-                match_replica_on_segment, [&](Replica& replica) {
-                    has_replica_on_segment = true;
-                    if (replica.is_memory_replica()) {
-                        MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
-                        MasterMetricManager::instance().dec_file_cache_nums();
-                    }
-                });
-
-            if (!has_replica_on_segment) {
+            // Probe whether this key has a replica on the target segment
+            // WITHOUT mutating metrics yet.
+            if (!metadata.HasReplica(match_replica_on_segment)) {
                 LOG(WARNING)
                     << "BatchReplicaClear: key=" << key
                     << " has no replica on segment_name=" << segment_name
@@ -1247,7 +1242,9 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
-            // Determine OpLog type based on remaining replicas after segment clear
+            // HA strong consistency: persist BEFORE mutating local state
+            // (metric counters + EraseReplicas + accessor.Erase). On
+            // persist failure metrics + metadata both stay unchanged.
             if (enable_ha_ && oplog_store_) {
                 auto remaining = BuildRemainingReplicaDescriptors(
                     metadata,
@@ -1269,6 +1266,15 @@ auto MasterService::BatchReplicaClear(
                     continue;  // skip this key on persist failure
                 }
             }
+
+            metadata.VisitReplicas(
+                match_replica_on_segment, [](Replica& replica) {
+                    if (replica.is_memory_replica()) {
+                        MasterMetricManager::instance().dec_mem_cache_nums();
+                    } else if (replica.is_disk_replica()) {
+                        MasterMetricManager::instance().dec_file_cache_nums();
+                    }
+                });
 
             metadata.EraseReplicas(match_replica_on_segment);
 
@@ -1635,6 +1641,18 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         // go.
         if (!metadata.HasReplica(&Replica::fn_is_completed) &&
             metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
+            // HA strong consistency: persist the REMOVE before mutating
+            // local state. The standby may not yet have seen this
+            // PROCESSING-only key (no PUT_END was emitted) but writing
+            // REMOVE is idempotent and protects against edge cases where
+            // a prior AddReplica/revoke sequence left state visible.
+            if (enable_ha_ && oplog_store_) {
+                auto err = PersistRemoveForHA("PutStart(overwrite REMOVE)",
+                                              key);
+                if (!err) {
+                    return tl::make_unexpected(err.error());
+                }
+            }
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 std::lock_guard lock(discarded_replicas_mutex_);
@@ -1643,11 +1661,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
             shard->processing_keys.erase(key);
-            if (enable_ha_ && it != shard->metadata.end()) {
-                AppendOrPersistOrEnqueue("PutStart(overwrite REMOVE)",
-                                         OpType::REMOVE, key, {},
-                                         PendingMutationKind::CLEAR_ALL_REPLICAS);
-            }
             shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -2983,8 +2996,52 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
-            // Clean up stale replica handles (consistent with single Remove)
+            // Clean up stale replica handles (consistent with single Remove).
+            // HA strong consistency: pre-compute whether the stale-handle
+            // sweep would invalidate the metadata WITHOUT mutating, persist
+            // REMOVE if needed, and only then run CleanupStaleHandles +
+            // erase the metadata. On persist failure skip the key.
+            const auto stale_pred =
+                [&alive_clients](const Replica& replica) {
+                    return (replica.has_invalid_mem_handle() ||
+                            replica.has_invalid_nof_handle() ||
+                            replica.has_stale_local_disk_client(
+                                alive_clients)) &&
+                           replica.is_completed();
+                };
+            const bool had_complete_replica =
+                it->second.HasReplica(&Replica::fn_is_completed);
+            // Predict post-cleanup remaining-COMPLETE descriptors.
+            auto remaining_after_cleanup = BuildRemainingReplicaDescriptors(
+                it->second, stale_pred);
+            const bool would_invalidate =
+                remaining_after_cleanup.empty() &&
+                !it->second.HasReplica([](const Replica& r) {
+                    return !r.is_completed();
+                });
+            if (would_invalidate) {
+                if (had_complete_replica && enable_ha_ && oplog_store_) {
+                    auto err = PersistRemoveForHA(
+                        "BatchRemove(stale cleanup)", key);
+                    if (!err) {
+                        results[original_idx] =
+                            tl::make_unexpected(err.error());
+                        continue;  // skip; do not invalidate metadata
+                    }
+                }
+                // Now safe to apply the cleanup + erase locally.
+                CleanupStaleHandles(it->second, alive_clients);
+                shard->processing_keys.erase(key);
+                shard->replication_tasks.erase(key);
+                shard->offloading_tasks.erase(key);
+                shard->metadata.erase(it);
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
             if (CleanupStaleHandles(it->second, alive_clients)) {
+                // Should not happen given would_invalidate is false, but
+                // keep the guard symmetric with the original code path.
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
@@ -3798,35 +3855,50 @@ void MasterService::DiscardExpiredProcessingReplicas(
         const auto ttl =
             metadata.put_start_time + put_start_release_timeout_sec_;
         if (ttl < now) {
-            bool had_complete_replica = metadata.HasReplica(
+            const bool had_complete_replica = metadata.HasReplica(
                 [](const Replica& r) {
                     return r.status() == ReplicaStatus::COMPLETE;
                 });
+            // Predict post-discard descriptors WITHOUT mutating: drop
+            // PROCESSING replicas; keep COMPLETE replicas.
+            auto post_descriptors = BuildRemainingReplicaDescriptors(
+                metadata, &Replica::fn_is_processing);
+            const bool would_invalidate = post_descriptors.empty();
+
+            // HA strong consistency: persist BEFORE PopReplicas. On
+            // persist failure leave metadata untouched so the next reaper
+            // pass can retry.
+            if (had_complete_replica && enable_ha_ && oplog_store_) {
+                tl::expected<OpLogEntry, ErrorCode> persist_result;
+                if (would_invalidate) {
+                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        OpType::REMOVE, *key_it, {});
+                } else {
+                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        OpType::PUT_END, *key_it,
+                        SerializeMetadataForOpLogFromReplicaDescriptors(
+                            metadata.client_id, metadata.size,
+                            post_descriptors));
+                }
+                if (!persist_result) {
+                    LOG(WARNING)
+                        << "DiscardExpiredProcessingReplicas: OpLog persist "
+                           "failed for key="
+                        << *key_it << ", err="
+                        << static_cast<int>(persist_result.error())
+                        << ", deferring discard";
+                    ++key_it;
+                    continue;
+                }
+            }
+
+            // Persist OK (or HA disabled / never published) — apply.
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
-
             if (!metadata.IsValid()) {
-                // All replicas of this object are discarded, just
-                // remove the whole object.
-                if (had_complete_replica && enable_ha_ && oplog_store_) {
-                    auto err = PersistRemoveForHA(
-                        "DiscardExpiredProcessingReplicas", *key_it);
-                    if (!err) {
-                        key_it = shard->processing_keys.erase(key_it);
-                        continue;  // Don't erase on persist failure
-                    }
-                }
                 shard->metadata.erase(it);
-            } else if (had_complete_replica && enable_ha_ && oplog_store_) {
-                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                    OpType::PUT_END, *key_it,
-                    SerializeMetadataForOpLogWithoutMemReplicas(metadata));
-                if (!persist_result) {
-                    key_it = shard->processing_keys.erase(key_it);
-                    continue;  // Don't modify metadata on persist failure
-                }
             }
 
             key_it = shard->processing_keys.erase(key_it);
@@ -3859,48 +3931,59 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         auto& metadata = metadata_it->second;
 
-        bool had_complete_replica = metadata.HasReplica(
+        const bool had_complete_replica = metadata.HasReplica(
             [](const Replica& r) {
                 return r.status() == ReplicaStatus::COMPLETE;
             });
+        auto& replica_ids = task_it->second.replica_ids;
+        const auto target_pred = [&replica_ids](const Replica& r) {
+            return std::find(replica_ids.begin(), replica_ids.end(),
+                             r.id()) != replica_ids.end();
+        };
+        // Predict post-discard descriptor list WITHOUT mutating: drop
+        // task target replicas; keep the rest of the COMPLETE replicas.
+        auto post_descriptors =
+            BuildRemainingReplicaDescriptors(metadata, target_pred);
+        const bool would_invalidate = post_descriptors.empty();
 
-        // Release source refcnt.
+        // HA strong consistency: persist BEFORE dec_refcnt / PopReplicas.
+        // On persist failure leave metadata + task untouched so the next
+        // reaper pass can retry.
+        if (had_complete_replica && enable_ha_ && oplog_store_) {
+            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            if (would_invalidate) {
+                persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    OpType::REMOVE, task_it->first, {});
+            } else {
+                persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                    OpType::PUT_END, task_it->first,
+                    SerializeMetadataForOpLogFromReplicaDescriptors(
+                        metadata.client_id, metadata.size, post_descriptors));
+            }
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "DiscardExpiredProcessingReplicas: OpLog persist "
+                       "failed for replication task key="
+                    << task_it->first
+                    << ", err="
+                    << static_cast<int>(persist_result.error())
+                    << ", deferring discard";
+                ++task_it;
+                continue;
+            }
+        }
+
+        // Persist OK (or HA disabled / never published) — apply.
         auto source = metadata.GetReplicaByID(task_it->second.source_id);
         if (source != nullptr) {
             source->dec_refcnt();
         }
-
-        // Discard allocated replicas.
-        auto& replica_ids = task_it->second.replica_ids;
-        auto replicas =
-            metadata.PopReplicas([&replica_ids](const Replica& replica) {
-                auto it = std::find(replica_ids.begin(), replica_ids.end(),
-                                    replica.id());
-                return it != replica_ids.end();
-            });
+        auto replicas = metadata.PopReplicas(target_pred);
         if (!replicas.empty()) {
             discarded_replicas.emplace_back(std::move(replicas), ttl);
         }
-
-        // Check whether the object is still valid.
         if (!metadata.IsValid()) {
-            if (had_complete_replica && enable_ha_ && oplog_store_) {
-                auto err = PersistRemoveForHA(
-                    "DiscardExpiredProcessingReplicas", task_it->first);
-                if (!err) {
-                    task_it = shard->replication_tasks.erase(task_it);
-                    continue;  // Don't erase on persist failure
-                }
-            }
             shard->metadata.erase(metadata_it);
-        } else if (had_complete_replica && enable_ha_ && oplog_store_) {
-            auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, task_it->first,
-                SerializeMetadataForOpLogWithoutMemReplicas(metadata));
-            if (!persist_result) {
-                task_it = shard->replication_tasks.erase(task_it);
-                continue;  // Don't modify metadata on persist failure
-            }
         }
 
         task_it = shard->replication_tasks.erase(task_it);

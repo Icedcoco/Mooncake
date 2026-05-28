@@ -645,6 +645,130 @@ TEST_F(MasterServiceHATest, BatchEvictPersistFailureSkipsMemReplicaErase) {
     }
 }
 
+// ===== Step 3: direct-erase + stale-cleanup + plan/apply =====
+
+// PutStart against an existing PROCESSING-only key triggers the overwrite-
+// REMOVE path once put_start_discard_timeout_sec elapses. With persist
+// failing, the path must NOT erase the metadata or pop replicas; the next
+// PutStart attempt (after the same timeout) must still see the old key.
+TEST_F(MasterServiceHATest, PutStartOverwritePersistFailureSkipsErase) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .set_put_start_discard_timeout_sec(1)
+                              .set_put_start_release_timeout_sec(2)
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "put_start_overwrite_persist_fail_key";
+
+    // PutStart but never PutEnd — leaves a PROCESSING-only metadata.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start = service->PutStart(client_id, key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+
+    // Wait for put_start_discard_timeout to elapse.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    // Second PutStart triggers the overwrite-REMOVE branch. With persist
+    // failing it must return error (not silently drop the old metadata).
+    const UUID client_id2 = generate_uuid();
+    auto retry_start = service->PutStart(client_id2, key, 1024, config);
+    EXPECT_FALSE(retry_start.has_value())
+        << "PutStart overwrite must return error when REMOVE persist fails";
+
+    // Restore persist; the overwrite must now succeed and the new
+    // PutStart must allocate a fresh PROCESSING replica for client_id2.
+    mock_store->SetWriteError(ErrorCode::OK);
+    auto retry2 = service->PutStart(client_id2, key, 1024, config);
+    EXPECT_TRUE(retry2.has_value())
+        << "PutStart overwrite must succeed once persist is restored";
+}
+
+// DiscardExpiredProcessingReplicas (Part 1) drops PROCESSING replicas of
+// PutStart-expired keys. When the key has been published to standby
+// (had_complete_replica == true via an existing LOCAL_DISK replica),
+// persist failure must NOT pop the PROCESSING memory replica locally.
+TEST_F(MasterServiceHATest,
+       DiscardExpiredProcessingReplicasPersistFailureSkipsPop) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .set_put_start_discard_timeout_sec(1)
+                              .set_put_start_release_timeout_sec(2)
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+    const std::string key = "discard_expired_persist_fail_key";
+
+    // PutStart but never PutEnd — leaves a PROCESSING memory replica.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start = service->PutStart(client_id, key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+
+    // AddReplica a COMPLETE LOCAL_DISK so the metadata has both a
+    // PROCESSING memory replica AND a COMPLETE local-disk descriptor.
+    // had_complete_replica will be true when the reaper runs.
+    Replica local_disk_replica(client_id, 1024, "ld_endpoint",
+                               ReplicaStatus::COMPLETE);
+    auto add_res = service->AddReplica(client_id, key, local_disk_replica);
+    ASSERT_TRUE(add_res.has_value());
+
+    // Wait for put_start_release_timeout to elapse so Part 1 considers
+    // the PROCESSING replica expired.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    // Drive an eviction cycle which calls DiscardExpiredProcessingReplicas
+    // up-front. With persist failing, the PROCESSING memory replica must
+    // NOT be popped from metadata.
+    service->RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                     /*evict_ratio_lowerbound=*/1.0);
+
+    // Restore persist and try PutEnd. If the reaper popped the
+    // PROCESSING memory replica, PutEnd will be a no-op and
+    // GetReplicaList will only see the LOCAL_DISK descriptor; if the
+    // PROCESSING memory replica was preserved, PutEnd marks it COMPLETE
+    // and GetReplicaList will return BOTH descriptors.
+    mock_store->SetWriteError(ErrorCode::OK);
+    auto end_res = service->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_res.has_value());
+
+    auto after = service->GetReplicaList(key);
+    ASSERT_TRUE(after.has_value());
+    bool has_memory = false;
+    bool has_local_disk = false;
+    for (const auto& desc : after->replicas) {
+        if (desc.is_memory_replica()) has_memory = true;
+        if (desc.is_local_disk_replica()) has_local_disk = true;
+    }
+    EXPECT_TRUE(has_memory)
+        << "Memory replica must still be present (and now COMPLETE) after "
+           "PutEnd, proving the reaper preserved the PROCESSING replica on "
+           "persist failure";
+    EXPECT_TRUE(has_local_disk)
+        << "LOCAL_DISK replica must still be present";
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
