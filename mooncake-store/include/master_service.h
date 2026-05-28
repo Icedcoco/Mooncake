@@ -58,6 +58,7 @@ class SnapshotChildProcessTest;
 // standing up a full snapshot catalog + child-process harness, and
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
+class MasterServiceHATest;
 }  // namespace test
 
 /*
@@ -72,6 +73,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::MasterServiceHATest;
 
    public:
     using NoFProbeFn =
@@ -98,6 +100,16 @@ class MasterService {
      */
     void SetOpLogRetryConfigForTesting(uint32_t max_attempts,
                                        uint32_t max_backoff_ms);
+
+    /**
+     * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
+     *        unit tests can drive a single eviction cycle synchronously
+     *        without standing up the periodic eviction thread.
+     */
+    void RunBatchEvictForTesting(double evict_ratio_target,
+                                 double evict_ratio_lowerbound);
+    void RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                    double evict_ratio_lowerbound);
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is

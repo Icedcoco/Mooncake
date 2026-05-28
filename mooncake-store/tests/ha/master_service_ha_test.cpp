@@ -596,6 +596,55 @@ TEST_F(MasterServiceHATest, PutRevokePersistFailureSkipsLocalMutation) {
            "was preserved after persist failure";
 }
 
+// ===== Step 2: strong-consistency eviction =====
+
+// BatchEvict must NOT erase MEMORY replicas when OpLog persist fails.
+TEST_F(MasterServiceHATest, BatchEvictPersistFailureSkipsMemReplicaErase) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    service->SetOpLogStoreForTesting(mock_store);
+    service->SetOpLogRetryConfigForTesting(2, 50);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = generate_uuid();
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 5; ++i) {
+        keys.push_back("evict_persist_fail_key_" + std::to_string(i));
+        PutObject(*service, client_id, keys.back());
+    }
+    // Wait for leases to expire so they become evictable.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
+    // Aggressive ratios so all eligible objects are picked.
+    service->RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                     /*evict_ratio_lowerbound=*/1.0);
+
+    // Memory replicas must remain because persist failed.
+    for (const auto& key : keys) {
+        auto list = service->GetReplicaList(key);
+        ASSERT_TRUE(list.has_value())
+            << "Key must still be retrievable: " << key;
+        bool has_memory = false;
+        for (const auto& desc : list->replicas) {
+            if (desc.is_memory_replica()) {
+                has_memory = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(has_memory)
+            << "Memory replica must remain after persist failure: " << key;
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

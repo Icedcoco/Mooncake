@@ -441,6 +441,16 @@ void MasterService::SetOpLogRetryConfigForTesting(uint32_t max_attempts,
                                                   std::memory_order_relaxed);
 }
 
+void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
+                                            double evict_ratio_lowerbound) {
+    BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+}
+
+void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                               double evict_ratio_lowerbound) {
+    NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+}
+
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
     std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
@@ -5144,6 +5154,45 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
+    // HA strong-consistency: persist the post-eviction state BEFORE the
+    // helper mutates `metadata`. Returns true on success (or when HA is
+    // disabled). On false, the caller must NOT call try_evict_or_offload
+    // and must NOT erase the metadata entry — local state must stay in
+    // sync with what was published.
+    auto persist_evict_oplog_or_skip =
+        [&, this](const std::string& key,
+                  const ObjectMetadata& metadata) -> bool {
+        if (!enable_ha_ || !oplog_store_) return true;
+
+        // Predict the descriptor list after evict_replicas() runs:
+        // drop COMPLETE memory replicas with refcnt==0; keep everything else
+        // that is COMPLETE.
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, [](const Replica& r) {
+                return r.is_memory_replica() && r.is_completed() &&
+                       r.get_refcnt() == 0;
+            });
+
+        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        if (remaining.empty()) {
+            persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::REMOVE, key, {});
+        } else {
+            persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                OpType::PUT_END, key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(
+                    metadata.client_id, metadata.size, remaining));
+        }
+        if (!persist_result) {
+            LOG(WARNING)
+                << "BatchEvict: OpLog persist failed for key=" << key
+                << ", err=" << static_cast<int>(persist_result.error())
+                << ", skipping eviction";
+            return false;
+        }
+        return true;
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards.
     size_t start_idx = RandomIndex(kNumShards);
@@ -5216,30 +5265,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
+                    // HA strong consistency: persist BEFORE the helper
+                    // mutates metadata. Skip on persist failure.
+                    if (!persist_evict_oplog_or_skip(it->first, it->second)) {
+                        ++it;
+                        continue;
+                    }
                     // Evict this object (or defer for offload)
                     uint64_t freed =
                         try_evict_or_offload(it->first, it->second, shard);
                     total_freed_size += freed;
-                    bool was_valid = it->second.IsValid();
-                    if (!was_valid) {
-                        // Last replica removed - write REMOVE OpLog
-                        if (enable_ha_ && oplog_store_) {
-                            AppendOrPersistOrEnqueue(
-                                "BatchEvict(last replica REMOVE)",
-                                OpType::REMOVE, it->first, {},
-                                PendingMutationKind::CLEAR_ALL_REPLICAS);
-                        }
+                    if (!it->second.IsValid()) {
                         it = shard->metadata.erase(it);
                     } else {
-                        // Still has disk/local replicas - write PUT_END
-                        if (enable_ha_ && oplog_store_) {
-                            AppendOrPersistOrEnqueue(
-                                "BatchEvict(has remaining replicas)",
-                                OpType::PUT_END, it->first,
-                                SerializeMetadataForOpLogWithoutMemReplicas(
-                                    it->second),
-                                PendingMutationKind::EVICT_MEM_REPLICAS);
-                        }
                         ++it;
                     }
                     if (freed > 0) {
@@ -5296,30 +5334,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
+                        // HA strong consistency: persist BEFORE the helper
+                        // mutates metadata. Skip on persist failure.
+                        if (!persist_evict_oplog_or_skip(it->first,
+                                                          it->second)) {
+                            ++it;
+                            continue;
+                        }
                         // Evict this object (or defer for offload)
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
-                        bool was_valid = it->second.IsValid();
-                        if (!was_valid) {
-                            // Last replica removed - write REMOVE OpLog
-                            if (enable_ha_ && oplog_store_) {
-                                AppendOrPersistOrEnqueue(
-                                    "BatchEvict(second pass, last replica REMOVE)",
-                                    OpType::REMOVE, it->first, {},
-                                    PendingMutationKind::CLEAR_ALL_REPLICAS);
-                            }
+                        if (!it->second.IsValid()) {
                             it = shard->metadata.erase(it);
                         } else {
-                            // Still has disk/local replicas - write PUT_END
-                            if (enable_ha_ && oplog_store_) {
-                                AppendOrPersistOrEnqueue(
-                                    "BatchEvict(second pass, has remaining replicas)",
-                                    OpType::PUT_END, it->first,
-                                    SerializeMetadataForOpLogWithoutMemReplicas(
-                                        it->second),
-                                    PendingMutationKind::EVICT_MEM_REPLICAS);
-                            }
                             ++it;
                         }
                         if (freed > 0) {
@@ -5366,30 +5394,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
+                        // HA strong consistency: persist BEFORE the helper
+                        // mutates metadata. Skip on persist failure.
+                        if (!persist_evict_oplog_or_skip(it->first,
+                                                          it->second)) {
+                            ++it;
+                            continue;
+                        }
                         // Evict this object (or defer for offload)
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
-                        bool was_valid = it->second.IsValid();
-                        if (!was_valid) {
-                            // Last replica removed - write REMOVE OpLog
-                            if (enable_ha_ && oplog_store_) {
-                                AppendOrPersistOrEnqueue(
-                                    "BatchEvict(soft pin, last replica REMOVE)",
-                                    OpType::REMOVE, it->first, {},
-                                    PendingMutationKind::CLEAR_ALL_REPLICAS);
-                            }
+                        if (!it->second.IsValid()) {
                             it = shard->metadata.erase(it);
                         } else {
-                            // Still has disk/local replicas - write PUT_END
-                            if (enable_ha_ && oplog_store_) {
-                                AppendOrPersistOrEnqueue(
-                                    "BatchEvict(soft pin, has remaining replicas)",
-                                    OpType::PUT_END, it->first,
-                                    SerializeMetadataForOpLogWithoutMemReplicas(
-                                        it->second),
-                                    PendingMutationKind::EVICT_MEM_REPLICAS);
-                            }
                             ++it;
                         }
                         if (freed > 0) {
@@ -5495,6 +5513,46 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 continue;
             }
 
+            // Probe: any NoF replicas eligible for eviction?
+            const bool has_evictable_nof =
+                metadata.HasReplica([](const Replica& r) {
+                    return r.is_nof_replica() && r.is_completed() &&
+                           r.get_refcnt() == 0;
+                });
+            if (!has_evictable_nof) {
+                ++it;
+                continue;
+            }
+
+            // HA strong consistency: persist BEFORE erasing NoF replicas.
+            // Skip the key on persist failure.
+            if (enable_ha_ && oplog_store_) {
+                auto remaining = BuildRemainingReplicaDescriptors(
+                    metadata, [](const Replica& r) {
+                        return r.is_nof_replica() && r.is_completed() &&
+                               r.get_refcnt() == 0;
+                    });
+                tl::expected<OpLogEntry, ErrorCode> persist_result;
+                if (remaining.empty()) {
+                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        OpType::REMOVE, it->first, {});
+                } else {
+                    persist_result = AppendOpLogAndNotifyDurableOrAbort(
+                        OpType::PUT_END, it->first,
+                        SerializeMetadataForOpLogFromReplicaDescriptors(
+                            metadata.client_id, metadata.size, remaining));
+                }
+                if (!persist_result) {
+                    LOG(WARNING)
+                        << "NoFBatchEvict: OpLog persist failed for key="
+                        << it->first
+                        << ", err=" << static_cast<int>(persist_result.error())
+                        << ", skipping eviction";
+                    ++it;
+                    continue;
+                }
+            }
+
             const size_t erased =
                 metadata.EraseReplicas([](const Replica& replica) {
                     return replica.is_nof_replica() && replica.is_completed() &&
@@ -5508,23 +5566,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             total_freed_size += metadata.size * erased;
             shard_evicted_count++;
             if (!metadata.IsValid()) {
-                // Last replica removed - write REMOVE OpLog
-                if (enable_ha_ && oplog_store_) {
-                    AppendOrPersistOrEnqueue(
-                        "NoFBatchEvict(last replica REMOVE)",
-                        OpType::REMOVE, it->first, {},
-                        PendingMutationKind::CLEAR_ALL_REPLICAS);
-                }
                 it = shard->metadata.erase(it);
             } else {
-                // Still has other replicas - write PUT_END
-                if (enable_ha_ && oplog_store_) {
-                    AppendOrPersistOrEnqueue(
-                        "NoFBatchEvict(has remaining replicas)",
-                        OpType::PUT_END, it->first,
-                        SerializeMetadataForOpLogWithoutMemReplicas(metadata),
-                        PendingMutationKind::EVICT_MEM_REPLICAS);
-                }
                 ++it;
             }
         }
