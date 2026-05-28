@@ -188,7 +188,8 @@ TEST_F(MasterServiceHATest, BatchRemovePersistFailureSkipsErase) {
     }
 }
 
-// PutRevoke on an object with only a MEMORY replica publishes REMOVE OpLog.
+// PutRevoke on an object with a PROCESSING MEMORY replica publishes REMOVE
+// OpLog.
 TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -203,7 +204,11 @@ TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
     const UUID client_id = generate_uuid();
     const std::string key = "put_revoke_single_key";
-    PutObject(*service, client_id, key);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start = service->PutStart(client_id, key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
 
     auto res = service->PutRevoke(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(res.has_value());
@@ -213,8 +218,8 @@ TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
     EXPECT_EQ(OpType::REMOVE, entry.op_type);
 }
 
-// PutRevoke(MEMORY) on an object with MEMORY + LOCAL_DISK publishes PUT_END
-// with the LOCAL_DISK descriptor.
+// PutRevoke(MEMORY) on an object with PROCESSING MEMORY + LOCAL_DISK publishes
+// PUT_END with the LOCAL_DISK descriptor.
 TEST_F(MasterServiceHATest, PutRevokeKeepsLocalDiskPublishesPutEndOpLog) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -229,7 +234,11 @@ TEST_F(MasterServiceHATest, PutRevokeKeepsLocalDiskPublishesPutEndOpLog) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
     const UUID client_id = generate_uuid();
     const std::string key = "put_revoke_mixed_key";
-    PutObject(*service, client_id, key);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start = service->PutStart(client_id, key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
 
     Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
                                ReplicaStatus::COMPLETE);
@@ -245,8 +254,8 @@ TEST_F(MasterServiceHATest, PutRevokeKeepsLocalDiskPublishesPutEndOpLog) {
     EXPECT_FALSE(entry.payload.empty());
 }
 
-// EvictDiskReplica on an object with MEMORY + DISK publishes PUT_END with the
-// MEMORY descriptor.
+// EvictDiskReplica(LOCAL_DISK) on an object with MEMORY + LOCAL_DISK publishes
+// PUT_END with the MEMORY descriptor.
 TEST_F(MasterServiceHATest, EvictDiskReplicaPublishesPutEndOpLog) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -263,11 +272,13 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaPublishesPutEndOpLog) {
     const std::string key = "evict_disk_key";
     PutObject(*service, client_id, key);
 
-    Replica disk_replica("/tmp/disk_file", 1024, ReplicaStatus::COMPLETE);
-    auto add_res = service->AddReplica(client_id, key, disk_replica);
+    Replica local_disk_replica(client_id, 1024, "local_disk_endpoint",
+                               ReplicaStatus::COMPLETE);
+    auto add_res = service->AddReplica(client_id, key, local_disk_replica);
     ASSERT_TRUE(add_res.has_value());
 
-    auto res = service->EvictDiskReplica(client_id, key, ReplicaType::DISK);
+    auto res =
+        service->EvictDiskReplica(client_id, key, ReplicaType::LOCAL_DISK);
     ASSERT_TRUE(res.has_value());
 
     OpLogEntry entry;
