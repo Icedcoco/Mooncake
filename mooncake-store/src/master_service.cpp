@@ -775,20 +775,19 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     // Cache endpoint before commit removes segment from registry
     std::string segment_name;
     std::string te_endpoint;
-    {
-        ScopedSegmentAccess info_access = segment_manager_.getSegmentAccess();
-        if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
-                                                   te_endpoint)) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-        }
+    if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
+                                                te_endpoint)) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
 
     // 3. Commit the unmount operation
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    {
+        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+        auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                    metrics_dec_capacity);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
 
     // Publish SEGMENT_UNMOUNT OpLog for HA after successful commit. The
