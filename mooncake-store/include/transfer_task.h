@@ -26,6 +26,9 @@
 
 namespace mooncake {
 
+constexpr int64_t kDefaultTransferEngineTimeoutMs = 60 * 1000;
+int64_t GetTransferEngineTimeoutMs();
+
 /**
  * @brief Transfer strategy enumeration
  */

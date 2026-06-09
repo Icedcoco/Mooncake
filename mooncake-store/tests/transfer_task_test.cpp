@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -30,6 +31,77 @@ class TransferTaskTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+class EnvVarGuard {
+   public:
+    explicit EnvVarGuard(const char* name) : name_(name) {
+        const char* current = std::getenv(name_);
+        if (current) {
+            had_value_ = true;
+            old_value_ = current;
+        }
+    }
+
+    ~EnvVarGuard() {
+        if (had_value_) {
+            setenv(name_, old_value_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    bool had_value_{false};
+    std::string old_value_;
+};
+
+TEST_F(TransferTaskTest, TransferEngineTimeoutUsesDefaultWhenUnset) {
+    EnvVarGuard store_timeout_guard("MC_STORE_TRANSFER_TIMEOUT_MS");
+    EnvVarGuard transfer_timeout_guard("MC_TRANSFER_TIMEOUT");
+    unsetenv("MC_STORE_TRANSFER_TIMEOUT_MS");
+    unsetenv("MC_TRANSFER_TIMEOUT");
+
+    EXPECT_EQ(GetTransferEngineTimeoutMs(),
+              kDefaultTransferEngineTimeoutMs);
+}
+
+TEST_F(TransferTaskTest, TransferEngineTimeoutUsesPositiveEnvOverride) {
+    EnvVarGuard store_timeout_guard("MC_STORE_TRANSFER_TIMEOUT_MS");
+    EnvVarGuard transfer_timeout_guard("MC_TRANSFER_TIMEOUT");
+    setenv("MC_STORE_TRANSFER_TIMEOUT_MS", "5000", 1);
+    unsetenv("MC_TRANSFER_TIMEOUT");
+
+    EXPECT_EQ(GetTransferEngineTimeoutMs(), 5000);
+}
+
+TEST_F(TransferTaskTest, TransferEngineTimeoutIgnoresInvalidEnvOverride) {
+    EnvVarGuard store_timeout_guard("MC_STORE_TRANSFER_TIMEOUT_MS");
+    EnvVarGuard transfer_timeout_guard("MC_TRANSFER_TIMEOUT");
+    setenv("MC_STORE_TRANSFER_TIMEOUT_MS", "invalid", 1);
+    unsetenv("MC_TRANSFER_TIMEOUT");
+
+    EXPECT_EQ(GetTransferEngineTimeoutMs(),
+              kDefaultTransferEngineTimeoutMs);
+}
+
+TEST_F(TransferTaskTest, TransferEngineTimeoutUsesLegacySecondsEnv) {
+    EnvVarGuard store_timeout_guard("MC_STORE_TRANSFER_TIMEOUT_MS");
+    EnvVarGuard transfer_timeout_guard("MC_TRANSFER_TIMEOUT");
+    unsetenv("MC_STORE_TRANSFER_TIMEOUT_MS");
+    setenv("MC_TRANSFER_TIMEOUT", "5", 1);
+
+    EXPECT_EQ(GetTransferEngineTimeoutMs(), 5000);
+}
+
+TEST_F(TransferTaskTest, TransferEngineTimeoutPrefersStoreSpecificEnv) {
+    EnvVarGuard store_timeout_guard("MC_STORE_TRANSFER_TIMEOUT_MS");
+    EnvVarGuard transfer_timeout_guard("MC_TRANSFER_TIMEOUT");
+    setenv("MC_STORE_TRANSFER_TIMEOUT_MS", "7000", 1);
+    setenv("MC_TRANSFER_TIMEOUT", "5", 1);
+
+    EXPECT_EQ(GetTransferEngineTimeoutMs(), 7000);
+}
 
 // Test basic MemcpyOperation functionality
 TEST_F(TransferTaskTest, MemcpyOperationBasic) {

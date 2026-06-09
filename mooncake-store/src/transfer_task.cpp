@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -16,6 +17,51 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+
+namespace mooncake {
+
+namespace {
+
+std::optional<int64_t> GetPositiveTimeoutEnvMs(const char* name,
+                                               int64_t multiplier_ms) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') {
+        return std::nullopt;
+    }
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long long parsed = std::strtoll(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value ||
+        (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0) {
+        LOG(WARNING) << "Invalid value for " << name << ": "
+                     << raw_value << ", using default "
+                     << kDefaultTransferEngineTimeoutMs;
+        return std::nullopt;
+    }
+    if (parsed > std::numeric_limits<int64_t>::max() / multiplier_ms) {
+        LOG(WARNING) << "Invalid value for " << name << ": "
+                     << raw_value << ", using default "
+                     << kDefaultTransferEngineTimeoutMs;
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(parsed) * multiplier_ms;
+}
+
+}  // namespace
+
+int64_t GetTransferEngineTimeoutMs() {
+    if (auto timeout_ms =
+            GetPositiveTimeoutEnvMs("MC_STORE_TRANSFER_TIMEOUT_MS", 1)) {
+        return *timeout_ms;
+    }
+    if (auto timeout_ms = GetPositiveTimeoutEnvMs("MC_TRANSFER_TIMEOUT", 1000)) {
+        return *timeout_ms;
+    }
+    return kDefaultTransferEngineTimeoutMs;
+}
+
+}  // namespace mooncake
 
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
@@ -785,8 +831,7 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
+    const int64_t timeout_milliseconds = GetTransferEngineTimeoutMs();
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
