@@ -32,16 +32,28 @@ void HttpMetadataServer::init_server() {
                 return;
             }
 
-            std::lock_guard<std::mutex> lock(store_mutex_);
-            auto it = store_.find(std::string(key));
-            if (it == store_.end()) {
+            std::string key_string(key);
+            std::string value;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lock(store_mutex_);
+                auto it = store_.find(key_string);
+                if (it != store_.end()) {
+                    value = it->second;
+                    found = true;
+                }
+            }
+
+            if (!found) {
+                LOG(WARNING) << "action=http_metadata_get, status=not_found, "
+                             << "key=" << key_string;
                 resp.set_status_and_content(status_type::not_found,
                                             "metadata not found");
                 return;
             }
 
             resp.add_header("Content-Type", "application/json");
-            resp.set_status_and_content(status_type::ok, it->second);
+            resp.set_status_and_content(status_type::ok, value);
         });
 
     // PUT /metadata?key=<key>
@@ -55,25 +67,42 @@ void HttpMetadataServer::init_server() {
             }
 
             std::string body(req.get_body());
+            std::string key_str(key);
+            bool duplicate_rpc_meta = false;
+            bool same_body = false;
             {
                 std::lock_guard<std::mutex> lock(store_mutex_);
-                std::string key_str(key);
                 if (key_str.find("rpc_meta") != std::string::npos) {
                     auto it = store_.find(key_str);
                     if (it != store_.end()) {
-                        if (it->second == body) {
-                            resp.set_status_and_content(status_type::ok,
-                                                        "metadata unchanged");
-                            return;
-                        }
-                        resp.set_status_and_content(
-                            status_type::bad_request,
-                            "Duplicate rpc_meta key not allowed");
-                        return;
+                        duplicate_rpc_meta = true;
+                        same_body = it->second == body;
+                    } else {
+                        store_[key_str] = body;
                     }
+                } else {
+                    store_[key_str] = body;
                 }
-                store_[std::move(key_str)] = body;
             }
+
+            if (duplicate_rpc_meta) {
+                LOG(WARNING)
+                    << "action=http_metadata_put, "
+                    << "status=duplicate_rpc_meta, "
+                    << "same_body=" << (same_body ? "true" : "false")
+                    << ", key=" << key_str;
+                if (same_body) {
+                    resp.set_status_and_content(status_type::ok,
+                                                "metadata unchanged");
+                    return;
+                }
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "Duplicate rpc_meta key not allowed");
+                return;
+            }
+            LOG(INFO) << "action=http_metadata_put, status=ok, key=" << key_str
+                      << ", body_size=" << body.size();
 
             resp.set_status_and_content(status_type::ok, "metadata updated");
         });
@@ -88,15 +117,27 @@ void HttpMetadataServer::init_server() {
                 return;
             }
 
-            std::lock_guard<std::mutex> lock(store_mutex_);
-            auto it = store_.find(std::string(key));
-            if (it == store_.end()) {
+            std::string key_string(key);
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lock(store_mutex_);
+                auto it = store_.find(key_string);
+                if (it != store_.end()) {
+                    store_.erase(it);
+                    found = true;
+                }
+            }
+
+            if (!found) {
+                LOG(WARNING) << "action=http_metadata_delete, "
+                             << "status=not_found, key=" << key_string;
                 resp.set_status_and_content(status_type::not_found,
                                             "metadata not found");
                 return;
             }
 
-            store_.erase(it);
+            LOG(INFO) << "action=http_metadata_delete, status=ok, key="
+                      << key_string;
             resp.set_status_and_content(status_type::ok, "metadata deleted");
         });
 
