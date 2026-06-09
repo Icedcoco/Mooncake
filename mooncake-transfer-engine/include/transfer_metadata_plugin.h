@@ -26,6 +26,11 @@ struct MetadataStoragePlugin {
     virtual ~MetadataStoragePlugin() {}
 
     virtual bool get(const std::string &key, Json::Value &value) = 0;
+    virtual bool get(const std::string &key, Json::Value &value,
+                     bool *not_found) {
+        if (not_found) *not_found = false;
+        return get(key, value);
+    }
     virtual bool set(const std::string &key, const Json::Value &value) = 0;
     virtual bool remove(const std::string &key) = 0;
 };

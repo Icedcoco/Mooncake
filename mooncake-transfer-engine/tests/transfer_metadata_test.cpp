@@ -12,18 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transfer_metadata.h"
-
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <cstdint>
 #include <cstdlib>
+#include <memory>
+#include <string>
+#include <unordered_map>
 
+#define private public
+#include "transfer_metadata.h"
+#undef private
+
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+namespace {
+
+class MissingMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        return get(key, value, nullptr);
+    }
+
+    bool get(const std::string &, Json::Value &, bool *not_found) override {
+        if (not_found) *not_found = true;
+        return false;
+    }
+
+    bool set(const std::string &, const Json::Value &) override { return true; }
+    bool remove(const std::string &) override { return true; }
+};
+
+std::shared_ptr<TransferMetadata::SegmentDesc> MakeSegmentDesc(
+    const std::string &name) {
+    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_desc->name = name;
+    segment_desc->protocol = "rdma";
+    return segment_desc;
+}
+
+}  // namespace
 
 namespace mooncake {
 
@@ -121,6 +160,67 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
     re = metadata_client->removeRpcMetaEntry("test_server");
     ASSERT_EQ(re, 0);
+}
+
+TEST_F(TransferMetadataTest, SegmentMetadataMissDoesNotInvalidateOnFirst404) {
+    metadata_client = std::make_unique<TransferMetadata>("http://metadata");
+    metadata_client->storage_plugin_ =
+        std::make_shared<MissingMetadataStoragePlugin>();
+
+    constexpr TransferMetadata::SegmentID segment_id = 2222222;
+    const std::string segment_name = "cached_remote_segment";
+    ASSERT_EQ(metadata_client->addLocalSegment(
+                  segment_id, segment_name, MakeSegmentDesc(segment_name)),
+              0);
+
+    EXPECT_EQ(metadata_client->getSegmentDescByName(segment_name, true),
+              nullptr);
+
+    auto cached_desc = metadata_client->getSegmentDescByName(segment_name, false);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->name, segment_name);
+}
+
+TEST_F(TransferMetadataTest, SegmentMetadataRepeatedMissInvalidatesCache) {
+    metadata_client = std::make_unique<TransferMetadata>("http://metadata");
+    metadata_client->storage_plugin_ =
+        std::make_shared<MissingMetadataStoragePlugin>();
+
+    constexpr TransferMetadata::SegmentID segment_id = 3333333;
+    const std::string segment_name = "stale_remote_segment";
+    ASSERT_EQ(metadata_client->addLocalSegment(
+                  segment_id, segment_name, MakeSegmentDesc(segment_name)),
+              0);
+
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(metadata_client->getSegmentDescByName(segment_name, true),
+                  nullptr);
+    }
+
+    EXPECT_EQ(metadata_client->getSegmentDescByName(segment_name, false),
+              nullptr);
+}
+
+TEST_F(TransferMetadataTest, MarkEndpointFailureDoesNothingInP2PMode) {
+    metadata_client = std::make_unique<TransferMetadata>(P2PHANDSHAKE);
+
+    const std::string segment_name = "p2p_peer";
+    ASSERT_EQ(metadata_client->addLocalSegment(
+                  4444444, segment_name, MakeSegmentDesc(segment_name)),
+              0);
+    TransferMetadata::RpcMetaDesc desc;
+    desc.ip_or_host_name = "127.0.0.1";
+    desc.rpc_port = 12345;
+    desc.sockfd = -1;
+    metadata_client->rpc_meta_map_[segment_name] = desc;
+
+    metadata_client->markEndpointFailure(segment_name);
+
+    auto cached_desc = metadata_client->getSegmentDescByName(segment_name, false);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->name, segment_name);
+    EXPECT_NE(metadata_client->rpc_meta_map_.find(segment_name),
+              metadata_client->rpc_meta_map_.end());
 }
 
 }  // namespace mooncake

@@ -261,6 +261,12 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     static inline bool is_200(long code) { return code == 200; }
 
     bool get(const std::string &key, Json::Value &value) override {
+        return get(key, value, nullptr);
+    }
+
+    bool get(const std::string &key, Json::Value &value,
+             bool *not_found) override {
+        if (not_found) *not_found = false;
         CURL *h = tl_easy();
         curl_easy_reset(h);
 
@@ -287,6 +293,11 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
         if (!is_200(code)) {
+            if (code == 404) {
+                if (not_found) *not_found = true;
+                VLOG(1) << "GET " << url << " http=404 body: " << readBody;
+                return false;
+            }
             LOG(ERROR) << "GET " << url << " http=" << code
                        << " body: " << readBody;
             return false;

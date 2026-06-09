@@ -19,6 +19,7 @@
 #include <cassert>
 #include <set>
 #include <algorithm>
+#include <tuple>
 
 #include "common.h"
 #include "config.h"
@@ -872,6 +873,81 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
     return ret;
 }
 
+bool TransferMetadata::recordSegmentMetadataMiss(
+    const std::string &segment_name) {
+    if (p2p_handshake_mode_) {
+        return false;
+    }
+    RWSpinlock::WriteGuard guard(metadata_suspect_lock_);
+    int count = ++segment_metadata_miss_count_[segment_name];
+    return count >= kMetadataMissInvalidateThreshold;
+}
+
+bool TransferMetadata::recordRpcMetaMiss(const std::string &server_name) {
+    if (p2p_handshake_mode_) {
+        return false;
+    }
+    RWSpinlock::WriteGuard guard(metadata_suspect_lock_);
+    int count = ++rpc_meta_miss_count_[server_name];
+    return count >= kMetadataMissInvalidateThreshold;
+}
+
+void TransferMetadata::clearSegmentMetadataMiss(
+    const std::string &segment_name) {
+    if (p2p_handshake_mode_) {
+        return;
+    }
+    RWSpinlock::WriteGuard guard(metadata_suspect_lock_);
+    segment_metadata_miss_count_.erase(segment_name);
+}
+
+void TransferMetadata::clearRpcMetaMiss(const std::string &server_name) {
+    if (p2p_handshake_mode_) {
+        return;
+    }
+    RWSpinlock::WriteGuard guard(metadata_suspect_lock_);
+    rpc_meta_miss_count_.erase(server_name);
+}
+
+void TransferMetadata::invalidateRemoteSegmentCache(
+    const std::string &segment_name) {
+    if (p2p_handshake_mode_) {
+        return;
+    }
+
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    ++segment_cache_generation_[segment_name];
+    auto it = segment_name_to_id_map_.find(segment_name);
+    if (it == segment_name_to_id_map_.end()) {
+        return;
+    }
+    if (it->second == LOCAL_SEGMENT_ID) {
+        return;
+    }
+    segment_id_to_desc_map_.erase(it->second);
+    segment_name_to_id_map_.erase(it);
+}
+
+void TransferMetadata::invalidateRpcMetaCache(
+    const std::string &server_name) {
+    if (p2p_handshake_mode_) {
+        return;
+    }
+
+    RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+    rpc_meta_map_.erase(server_name);
+    ++rpc_meta_generation_[server_name];
+}
+
+void TransferMetadata::markEndpointFailure(const std::string &server_name) {
+    if (p2p_handshake_mode_) {
+        return;
+    }
+
+    invalidateRemoteSegmentCache(server_name);
+    invalidateRpcMetaCache(server_name);
+}
+
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     const std::string &segment_name) {
     Json::Value peer_json;
@@ -899,12 +975,24 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             return nullptr;
         }
     } else {
+        bool not_found = false;
         if (!storage_plugin_->get(getFullMetadataKey(segment_name),
-                                  peer_json)) {
+                                  peer_json, &not_found)) {
+            if (!not_found) {
+                LOG(WARNING) << "Failed to retrieve segment descriptor, name "
+                             << segment_name;
+                return nullptr;
+            }
+            bool should_invalidate = recordSegmentMetadataMiss(segment_name);
             LOG(WARNING) << "Failed to retrieve segment descriptor, name "
-                         << segment_name;
+                         << segment_name
+                         << ", should_invalidate " << should_invalidate;
+            if (should_invalidate) {
+                invalidateRemoteSegmentCache(segment_name);
+            }
             return nullptr;
         }
+        clearSegmentMetadataMiss(segment_name);
     }
 
     auto result = decodeSegmentDesc(peer_json, segment_name);
@@ -935,31 +1023,41 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     // Collect segment names to sync first, then release lock before network I/O
-    std::vector<std::string> names_to_sync;
+    std::vector<std::pair<std::string, uint64_t>> names_to_sync;
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
         for (const auto &entry : segment_id_to_desc_map_) {
             if (entry.first == LOCAL_SEGMENT_ID) continue;
             if (!segment_name.empty() && entry.second->name != segment_name)
                 continue;
-            names_to_sync.push_back(entry.second->name);
+            auto generation_it =
+                segment_cache_generation_.find(entry.second->name);
+            names_to_sync.emplace_back(
+                entry.second->name,
+                generation_it == segment_cache_generation_.end()
+                    ? 0
+                    : generation_it->second);
         }
     }
 
     // Fetch updates without holding lock (may involve network I/O)
-    std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
-    for (const auto &name : names_to_sync) {
+    std::vector<std::tuple<std::string, uint64_t, std::shared_ptr<SegmentDesc>>>
+        updates;
+    for (const auto &[name, generation] : names_to_sync) {
         auto segment_desc = getSegmentDesc(name);
         if (segment_desc) {
-            updates.emplace_back(name, segment_desc);
+            updates.emplace_back(name, generation, segment_desc);
         } else {
-            LOG(WARNING) << "segment " << name << " is now invalid";
+            LOG(WARNING) << "Failed to refresh segment metadata for " << name;
         }
     }
 
     // Apply updates with write lock
     RWSpinlock::WriteGuard guard(segment_lock_);
-    for (const auto &[name, desc] : updates) {
+    for (const auto &[name, generation, desc] : updates) {
+        if (segment_cache_generation_[name] != generation) {
+            continue;
+        }
         auto it = segment_name_to_id_map_.find(name);
         if (it != segment_name_to_id_map_.end()) {
             segment_id_to_desc_map_[it->second] = desc;
@@ -988,12 +1086,29 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
         }
     }
 
+    uint64_t generation = 0;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto generation_it = segment_cache_generation_.find(segment_name);
+        if (generation_it != segment_cache_generation_.end()) {
+            generation = generation_it->second;
+        }
+    }
+
     // Fetch segment descriptor without holding lock (may involve network I/O)
     auto segment_desc = this->getSegmentDesc(segment_name);
     if (!segment_desc) return nullptr;
 
     // Update cache with write lock
     RWSpinlock::WriteGuard guard(segment_lock_);
+    if (!p2p_handshake_mode_) {
+        auto generation_it = segment_cache_generation_.find(segment_name);
+        if ((generation_it == segment_cache_generation_.end()
+                 ? 0
+                 : generation_it->second) != generation) {
+            return nullptr;
+        }
+    }
     auto iter = segment_name_to_id_map_.find(segment_name);
     SegmentID segment_id;
     if (iter != segment_name_to_id_map_.end()) {
@@ -1012,10 +1127,15 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
         (!globalConfig().metacache || force_update)) {
         // Get segment name without holding lock during network I/O
         std::string segment_name;
+        uint64_t generation = 0;
         {
             RWSpinlock::ReadGuard guard(segment_lock_);
             if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
             segment_name = segment_id_to_desc_map_[segment_id]->name;
+            auto generation_it = segment_cache_generation_.find(segment_name);
+            if (generation_it != segment_cache_generation_.end()) {
+                generation = generation_it->second;
+            }
         }
 
         // Fetch segment descriptor without holding lock (may involve network
@@ -1025,6 +1145,14 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
 
         // Update cache with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
+        if (!p2p_handshake_mode_) {
+            auto generation_it = segment_cache_generation_.find(segment_name);
+            if ((generation_it == segment_cache_generation_.end()
+                     ? 0
+                     : generation_it->second) != generation) {
+                return nullptr;
+            }
+        }
         segment_id_to_desc_map_[segment_id] = segment_desc;
         return segment_id_to_desc_map_[segment_id];
     } else {
@@ -1042,6 +1170,15 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
             return segment_name_to_id_map_[segment_name];
     }
 
+    uint64_t generation = 0;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto generation_it = segment_cache_generation_.find(segment_name);
+        if (generation_it != segment_cache_generation_.end()) {
+            generation = generation_it->second;
+        }
+    }
+
     // Fetch segment descriptor without holding lock (may involve network I/O)
     auto segment_desc = this->getSegmentDesc(segment_name);
     if (!segment_desc) return -1;
@@ -1050,6 +1187,14 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name))
         return segment_name_to_id_map_[segment_name];
+    if (!p2p_handshake_mode_) {
+        auto generation_it = segment_cache_generation_.find(segment_name);
+        if ((generation_it == segment_cache_generation_.end()
+                 ? 0
+                 : generation_it->second) != generation) {
+            return -1;
+        }
+    }
     SegmentID id = next_segment_id_.fetch_add(1);
     segment_id_to_desc_map_[id] = segment_desc;
     segment_name_to_id_map_[segment_name] = id;
@@ -1192,6 +1337,7 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
         desired["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
         desired["rpc_port"] = static_cast<Json::UInt>(local_rpc_meta_.rpc_port);
         if (existing == desired) {
+            clearRpcMetaMiss(server_name);
             return 0;
         }
     }
@@ -1204,33 +1350,61 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
         LOG(ERROR) << "Failed to re-publish RPC meta entry for " << server_name;
         return ERR_METADATA;
     }
+    clearRpcMetaMiss(server_name);
     return 0;
 }
 
 int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
+    uint64_t generation = 0;
     {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
             desc = rpc_meta_map_[server_name];
             return 0;
         }
+        auto generation_it = rpc_meta_generation_.find(server_name);
+        if (generation_it != rpc_meta_generation_.end()) {
+            generation = generation_it->second;
+        }
     }
-    RWSpinlock::WriteGuard guard(rpc_meta_lock_);
     if (p2p_handshake_mode_) {
         auto [ip, port] = parseHostNameWithPort(server_name);
         desc.ip_or_host_name = ip;
         desc.rpc_port = port;
     } else {
         Json::Value rpcMetaJSON;
-        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name,
-                                  rpcMetaJSON)) {
-            LOG(ERROR) << "Failed to find location of " << server_name;
+        bool not_found = false;
+        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name, rpcMetaJSON,
+                                  &not_found)) {
+            if (!not_found) {
+                LOG(ERROR) << "Failed to find location of " << server_name;
+                return ERR_METADATA;
+            }
+            bool should_invalidate = recordRpcMetaMiss(server_name);
+            LOG(ERROR) << "Failed to find location of " << server_name
+                       << ", should_invalidate " << should_invalidate;
+            if (should_invalidate) {
+                invalidateRpcMetaCache(server_name);
+            }
             return ERR_METADATA;
         }
-        desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
-        desc.rpc_port = (uint16_t)rpcMetaJSON["rpc_port"].asUInt();
+        clearRpcMetaMiss(server_name);
+        RpcMetaDesc fetched_desc;
+        fetched_desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
+        fetched_desc.rpc_port = (uint16_t)rpcMetaJSON["rpc_port"].asUInt();
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        auto generation_it = rpc_meta_generation_.find(server_name);
+        if ((generation_it == rpc_meta_generation_.end()
+                 ? 0
+                 : generation_it->second) != generation) {
+            return ERR_METADATA;
+        }
+        desc = fetched_desc;
+        rpc_meta_map_[server_name] = desc;
+        return 0;
     }
+    RWSpinlock::WriteGuard guard(rpc_meta_lock_);
     rpc_meta_map_[server_name] = desc;
     return 0;
 }
@@ -1276,7 +1450,10 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     Json::Value peer;
     int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
-    if (ret) return ret;
+    if (ret) {
+        markEndpointFailure(peer_server_name);
+        return ret;
+    }
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "

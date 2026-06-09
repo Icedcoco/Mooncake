@@ -997,6 +997,7 @@ void TcpTransport::startTransfer(Slice* slice) {
     if (!socket) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get connection to "
                    << meta_entry.ip_or_host_name << ":" << desc->tcp_data_port;
+        metadata_->markEndpointFailure(desc->name);
         slice->markFailed();
         return;
     }

@@ -195,6 +195,9 @@ class TransferMetadata {
     int rePublishRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+
+    void markEndpointFailure(const std::string &server_name);
+
     int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
@@ -228,6 +231,14 @@ class TransferMetadata {
     int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
     std::string getFullMetadataKey(const std::string &segment_name) const;
 
+    static constexpr int kMetadataMissInvalidateThreshold = 3;
+    bool recordSegmentMetadataMiss(const std::string &segment_name);
+    bool recordRpcMetaMiss(const std::string &server_name);
+    void clearSegmentMetadataMiss(const std::string &segment_name);
+    void clearRpcMetaMiss(const std::string &server_name);
+    void invalidateRemoteSegmentCache(const std::string &segment_name);
+    void invalidateRpcMetaCache(const std::string &server_name);
+
     bool p2p_handshake_mode_{false};
     std::string common_key_prefix_;
     std::string rpc_meta_prefix_;
@@ -236,12 +247,17 @@ class TransferMetadata {
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
+    std::unordered_map<std::string, uint64_t> segment_cache_generation_;
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
+    std::unordered_map<std::string, uint64_t> rpc_meta_generation_;
     RpcMetaDesc local_rpc_meta_;
+    RWSpinlock metadata_suspect_lock_;
+    std::unordered_map<std::string, int> segment_metadata_miss_count_;
+    std::unordered_map<std::string, int> rpc_meta_miss_count_;
 
     std::atomic<SegmentID> next_segment_id_;
 
