@@ -564,10 +564,10 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
-            if (request_buffer_id >= 0 && request_device_id >= 0) {
+            if (trySelectCachedLocalDevice(request_buffer_id,
+                                           request_device_id, buffer_id,
+                                           device_id)) {
                 found_device = true;
-                buffer_id = request_buffer_id;
-                device_id = request_device_id;
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
@@ -781,5 +781,24 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 int retry_count) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
                         retry_count);
+}
+
+bool RdmaTransport::trySelectCachedLocalDevice(int request_buffer_id,
+                                               int request_device_id,
+                                               int &buffer_id,
+                                               int &device_id) const {
+    if (request_buffer_id < 0 || request_device_id < 0 ||
+        request_device_id >= static_cast<int>(context_list_.size())) {
+        return false;
+    }
+
+    const auto &context = context_list_[request_device_id];
+    if (!context || !context->active()) {
+        return false;
+    }
+
+    buffer_id = request_buffer_id;
+    device_id = request_device_id;
+    return true;
 }
 }  // namespace mooncake

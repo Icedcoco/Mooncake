@@ -18,6 +18,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common.h"
 #include "error.h"
@@ -48,6 +49,20 @@ class RdmaTransportTestPeer {
                              std::string local_server_name) {
         transport.metadata_ = std::move(metadata);
         transport.local_server_name_ = std::move(local_server_name);
+    }
+
+    static void setContexts(
+        RdmaTransport &transport,
+        std::vector<std::shared_ptr<RdmaContext>> contexts) {
+        transport.context_list_ = std::move(contexts);
+    }
+
+    static bool trySelectCachedLocalDevice(const RdmaTransport &transport,
+                                           int request_buffer_id,
+                                           int request_device_id,
+                                           int &buffer_id, int &device_id) {
+        return transport.trySelectCachedLocalDevice(
+            request_buffer_id, request_device_id, buffer_id, device_id);
     }
 };
 
@@ -139,6 +154,40 @@ TEST_F(RdmaContextReprobeTest,
     EXPECT_EQ(context_->gid(), formatGid(kCurrentGid));
     auto after_desc = localDesc();
     EXPECT_EQ(after_desc.get(), before_desc.get());
+}
+
+TEST_F(RdmaContextReprobeTest, CachedLocalDeviceMustBeActive) {
+    auto inactive_context = new RdmaContext(*transport_, "synthetic0");
+    auto active_context = new RdmaContext(*transport_, "synthetic1");
+    MC_LSAN_IGNORE_OBJECT(inactive_context);
+    MC_LSAN_IGNORE_OBJECT(active_context);
+    inactive_context->set_active(false);
+    active_context->set_active(true);
+
+    std::vector<std::shared_ptr<RdmaContext>> contexts;
+    contexts.emplace_back(inactive_context, [](RdmaContext *) {});
+    contexts.emplace_back(active_context, [](RdmaContext *) {});
+    RdmaTransportTestPeer::setContexts(*transport_, std::move(contexts));
+
+    int buffer_id = -1;
+    int device_id = -1;
+    EXPECT_FALSE(RdmaTransportTestPeer::trySelectCachedLocalDevice(
+        *transport_, /*request_buffer_id=*/0, /*request_device_id=*/0,
+        buffer_id, device_id));
+    EXPECT_EQ(buffer_id, -1);
+    EXPECT_EQ(device_id, -1);
+
+    EXPECT_TRUE(RdmaTransportTestPeer::trySelectCachedLocalDevice(
+        *transport_, /*request_buffer_id=*/0, /*request_device_id=*/1,
+        buffer_id, device_id));
+    EXPECT_EQ(buffer_id, 0);
+    EXPECT_EQ(device_id, 1);
+
+    buffer_id = -1;
+    device_id = -1;
+    EXPECT_FALSE(RdmaTransportTestPeer::trySelectCachedLocalDevice(
+        *transport_, /*request_buffer_id=*/0, /*request_device_id=*/2,
+        buffer_id, device_id));
 }
 
 }  // namespace

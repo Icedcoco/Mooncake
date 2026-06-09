@@ -132,6 +132,10 @@ class RdmaTransport : public Transport {
                             int &device_id, int retry_cnt = 0);
 
    private:
+    bool trySelectCachedLocalDevice(int request_buffer_id,
+                                    int request_device_id, int &buffer_id,
+                                    int &device_id) const;
+
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
