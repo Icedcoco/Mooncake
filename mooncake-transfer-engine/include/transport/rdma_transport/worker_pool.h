@@ -52,6 +52,10 @@ class WorkerPool {
 
     void markRailFailed(const std::string &peer_nic_path);
     bool isRailAvailable(const std::string &peer_nic_path);
+    bool selectAvailableRail(Transport::SegmentDesc *peer_segment_desc,
+                             int buffer_id, int &device_id,
+                             uint32_t &dest_rkey,
+                             std::string &peer_nic_path);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);

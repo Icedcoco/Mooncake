@@ -141,37 +141,16 @@ int WorkerPool::submitPostSend(
             slice->markFailed();
             continue;
         }
-        slice->rdma.dest_rkey =
-            peer_segment_desc->buffers[buffer_id].rkey[device_id];
-        auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->nicPathServerName(),
-                        peer_segment_desc->devices[device_id].name);
-
-        // If selected rail is paused, try alternative devices
-        if (!isRailAvailable(peer_nic_path)) {
-            bool found = false;
-            for (size_t alt_dev_id = 0;
-                 alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
-                if (alt_dev_id == (size_t)device_id) continue;
-                auto alt_path =
-                    MakeNicPath(peer_segment_desc->name,
-                                peer_segment_desc->devices[alt_dev_id].name);
-                if (isRailAvailable(alt_path)) {
-                    device_id = alt_dev_id;
-                    slice->rdma.dest_rkey =
-                        peer_segment_desc->buffers[buffer_id].rkey[device_id];
-                    peer_nic_path = alt_path;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                slice->markFailed();  // All rails unavailable
-                all_rails_failed_count++;
-                continue;
-            }
+        uint32_t dest_rkey = 0;
+        std::string peer_nic_path;
+        if (!selectAvailableRail(peer_segment_desc.get(), buffer_id, device_id,
+                                 dest_rkey, peer_nic_path)) {
+            slice->markFailed();  // All rails unavailable
+            all_rails_failed_count++;
+            continue;
         }
 
+        slice->rdma.dest_rkey = dest_rkey;
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
         slice_list_map[shard_id].push_back(slice);
@@ -429,11 +408,15 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 processed_slice_count_++;
                 continue;
             }
-            slice->rdma.dest_rkey =
-                peer_segment_desc->buffers[buffer_id].rkey[device_id];
-            auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->nicPathServerName(),
-                            peer_segment_desc->devices[device_id].name);
+            uint32_t dest_rkey = 0;
+            std::string peer_nic_path;
+            if (!selectAvailableRail(peer_segment_desc.get(), buffer_id,
+                                     device_id, dest_rkey, peer_nic_path)) {
+                slice->markFailed();
+                processed_slice_count_++;
+                continue;
+            }
+            slice->rdma.dest_rkey = dest_rkey;
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
         }
@@ -599,6 +582,44 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
         state.pause_until_ns = 0;
         return true;
     }
+    return false;
+}
+
+bool WorkerPool::selectAvailableRail(Transport::SegmentDesc *peer_segment_desc,
+                                     int buffer_id, int &device_id,
+                                     uint32_t &dest_rkey,
+                                     std::string &peer_nic_path) {
+    if (!peer_segment_desc || buffer_id < 0 ||
+        buffer_id >= static_cast<int>(peer_segment_desc->buffers.size()) ||
+        device_id < 0 ||
+        device_id >= static_cast<int>(peer_segment_desc->devices.size())) {
+        return false;
+    }
+
+    const auto &buffer = peer_segment_desc->buffers[buffer_id];
+    const auto &server_name = peer_segment_desc->nicPathServerName();
+    auto selected_path =
+        MakeNicPath(server_name, peer_segment_desc->devices[device_id].name);
+    if (isRailAvailable(selected_path)) {
+        dest_rkey = buffer.rkey[device_id];
+        peer_nic_path = selected_path;
+        return true;
+    }
+
+    for (size_t alt_dev_id = 0; alt_dev_id < peer_segment_desc->devices.size();
+         ++alt_dev_id) {
+        if (alt_dev_id == static_cast<size_t>(device_id)) continue;
+        auto alt_path =
+            MakeNicPath(server_name,
+                        peer_segment_desc->devices[alt_dev_id].name);
+        if (isRailAvailable(alt_path)) {
+            device_id = static_cast<int>(alt_dev_id);
+            dest_rkey = buffer.rkey[device_id];
+            peer_nic_path = alt_path;
+            return true;
+        }
+    }
+
     return false;
 }
 
