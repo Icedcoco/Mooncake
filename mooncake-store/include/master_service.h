@@ -49,6 +49,7 @@ class EvictionStrategy;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+class MasterServiceTest_ClearInvalidHandlesReportsStatsForEmptyMetadata_Test;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
 // deserialize cycle directly via the otherwise-private
 // MetadataSerializer, and inspect private clamp fields. This avoids
@@ -69,6 +70,8 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::
+        MasterServiceTest_ClearInvalidHandlesReportsStatsForEmptyMetadata_Test;
 
    public:
     using NoFProbeFn =
@@ -774,10 +777,11 @@ class MasterService {
     // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
 
-    // Clear invalid handles in all shards
-    void ClearInvalidHandles();
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+    struct ClearInvalidHandlesStats;
+    ClearInvalidHandlesStats ClearInvalidHandles();
+    ClearInvalidHandlesStats ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+        size_t cleanup_trigger_clients = 0);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -1274,11 +1278,21 @@ class MasterService {
                             const std::string& key,
                             const ObjectMetadata& metadata) const;
 
+    struct ClearInvalidHandlesStats {
+        size_t scanned_shards = 0;
+        size_t scanned_objects = 0;
+        size_t removed_objects = 0;
+        size_t cleanup_trigger_clients = 0;
+        int64_t elapsed_ms = 0;
+    };
+
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
         ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+    void LogClearInvalidHandlesStats(
+        const ClearInvalidHandlesStats& stats) const;
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.

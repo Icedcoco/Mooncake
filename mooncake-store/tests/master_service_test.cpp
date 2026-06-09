@@ -227,6 +227,15 @@ TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     EXPECT_EQ(legacy_key, "legacy_key");
 }
 
+TEST_F(MasterServiceTest, ClearInvalidHandlesReportsStatsForEmptyMetadata) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    auto stats = service->ClearInvalidHandles();
+    EXPECT_GT(stats.scanned_shards, 0);
+    EXPECT_EQ(stats.scanned_objects, 0);
+    EXPECT_EQ(stats.removed_objects, 0);
+    EXPECT_GE(stats.elapsed_ms, 0);
+}
+
 std::string GenerateKeyForSegment(const UUID& client_id,
                                   const std::unique_ptr<MasterService>& service,
                                   const std::string& segment_name) {
@@ -3526,6 +3535,21 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               segment2.name);
+}
+
+TEST_F(MasterServiceTest, UnmountSegmentCommitsBeforeCleanupRegression) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    auto segment = MakeSegment("unmount_commit_before_cleanup_segment");
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    auto unmount_result = service->UnmountSegment(segment.id, client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    auto status = service->QuerySegmentStatus(segment.name);
+    ASSERT_FALSE(status.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, status.error());
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {

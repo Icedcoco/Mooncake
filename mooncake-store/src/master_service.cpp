@@ -757,25 +757,33 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
     }
 }
 
-void MasterService::ClearInvalidHandles() {
-    ClearInvalidHandles(getAliveClientsSnapshot());
+MasterService::ClearInvalidHandlesStats MasterService::ClearInvalidHandles() {
+    return ClearInvalidHandles(getAliveClientsSnapshot());
 }
 
-void MasterService::ClearInvalidHandles(
-    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+MasterService::ClearInvalidHandlesStats MasterService::ClearInvalidHandles(
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+    size_t cleanup_trigger_clients) {
+    ClearInvalidHandlesStats stats;
+    stats.cleanup_trigger_clients = cleanup_trigger_clients;
+    const auto start_time = std::chrono::steady_clock::now();
+
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
+        ++stats.scanned_shards;
         for (auto tenant_it = shard->tenants.begin();
              tenant_it != shard->tenants.end();) {
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
+                ++stats.scanned_objects;
                 if (CleanupStaleHandles(it->second, alive_clients)) {
                     tenant_state.processing_keys.erase(it->first);
                     tenant_state.replication_tasks.erase(it->first);
                     tenant_state.offloading_tasks.erase(it->first);
                     ErasePromotionTaskIfPresent(tenant_state, it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first);
+                    ++stats.removed_objects;
                 } else {
                     ++it;
                 }
@@ -786,6 +794,36 @@ void MasterService::ClearInvalidHandles(
                 ++tenant_it;
             }
         }
+    }
+
+    stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start_time)
+                           .count();
+    LogClearInvalidHandlesStats(stats);
+    return stats;
+}
+
+void MasterService::LogClearInvalidHandlesStats(
+    const ClearInvalidHandlesStats& stats) const {
+    const bool log_as_info = stats.cleanup_trigger_clients > 0 ||
+                             stats.removed_objects > 0 ||
+                             stats.elapsed_ms >= 100;
+    if (log_as_info) {
+        LOG(INFO) << "action=clear_invalid_handles"
+                  << ", scanned_shards=" << stats.scanned_shards
+                  << ", scanned_objects=" << stats.scanned_objects
+                  << ", removed_objects=" << stats.removed_objects
+                  << ", cleanup_trigger_clients="
+                  << stats.cleanup_trigger_clients
+                  << ", elapsed_ms=" << stats.elapsed_ms;
+    } else {
+        VLOG(1) << "action=clear_invalid_handles"
+                << ", scanned_shards=" << stats.scanned_shards
+                << ", scanned_objects=" << stats.scanned_objects
+                << ", removed_objects=" << stats.removed_objects
+                << ", cleanup_trigger_clients="
+                << stats.cleanup_trigger_clients
+                << ", elapsed_ms=" << stats.elapsed_ms;
     }
 }
 
@@ -831,19 +869,21 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
-    }  // Release the segment mutex before long-running step 2 and avoid
-       // deadlocks
+    }  // Release the segment mutex before commit and avoid deadlocks
 
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles();
-
-    // 3. Commit the unmount operation
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    // 2. Commit the unmount operation
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                       metrics_dec_capacity);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
+
+    // 3. Remove the metadata of the related objects
+    ClearInvalidHandles();
     return {};
 }
 
@@ -908,20 +948,21 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
-    }  // Release the segment mutex before long-running step 2 and avoid
-       // deadlocks
+    }  // Release the segment mutex before commit and avoid deadlocks
 
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles();
-
-    // 3. Commit the unmount operation
-    ScopedNoFSegmentAccess segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    // 2. Commit the unmount operation
+    {
+        ScopedNoFSegmentAccess segment_access =
+            nof_segment_manager_.getNoFSegmentAccess();
+        auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                       metrics_dec_capacity);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
+
+    // 3. Remove the metadata of the related objects
+    ClearInvalidHandles();
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
@@ -5587,13 +5628,7 @@ void MasterService::ClientMonitorFunc() {
                         }
                     }
                 }
-            }  // Release the mutex before long-running ClearInvalidHandles and
-               // avoid deadlocks
-
-            // Always clean up invalid handles when there are expired clients,
-            // even if no memory segments were unmounted. This is necessary
-            // to clean up local_disk replicas whose owner client has expired.
-            ClearInvalidHandles();
+            }  // Release the mutex before commit and avoid deadlocks
 
             // Commit unmount of memory segments and clean up local_disk
             // segments for expired clients. Both require the exclusive
@@ -5602,8 +5637,18 @@ void MasterService::ClientMonitorFunc() {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(
+                    auto err = segment_access.CommitUnmountSegment(
                         unmount_segments[i], client_ids[i], dec_capacities[i]);
+                    if (err != ErrorCode::OK &&
+                        err != ErrorCode::SEGMENT_NOT_FOUND) {
+                        LOG(ERROR)
+                            << "client_id=" << client_ids[i]
+                            << ", segment_name=" << segment_names[i]
+                            << ", error=commit_unmount_expired_mem_segment_"
+                               "failed"
+                            << ", reason=" << err;
+                        continue;
+                    }
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_mem_segment";
@@ -5612,6 +5657,12 @@ void MasterService::ClientMonitorFunc() {
                     segment_access.UnmountLocalDiskSegment(client_id);
                 }
             }
+
+            // Always clean up invalid handles after expired-client commits,
+            // even if no memory segments were unmounted. This is necessary
+            // to clean up local_disk replicas whose owner client has expired.
+            ClearInvalidHandles(getAliveClientsSnapshot(),
+                                expired_clients.size());
         }
 
         std::this_thread::sleep_for(
@@ -5672,8 +5723,6 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         }
     }
 
-    ClearInvalidHandles();
-
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = nof_segment_access.CommitUnmountSegment(
@@ -5687,6 +5736,8 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
             return false;
         }
     }
+
+    ClearInvalidHandles();
 
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
