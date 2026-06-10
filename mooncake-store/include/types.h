@@ -372,6 +372,15 @@ enum class ErrorCode : int32_t {
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
         -1011,  ///< Request cannot be done in current mode.
+    SEQUENCE_CONFLICT =
+        -1012,  ///< Stage 3: durable batch / sequence progression rejected
+                ///< because the incoming batch_id does not match the expected
+                ///< next batch_id (= latest_batch + 1), or because the same
+                ///< batch_id already carries a different payload.
+    STALE_LEADER =
+        -1013,  ///< Stage 3: incoming batch was produced under a leadership
+                ///< session that no longer matches the durable history; the
+                ///< caller must drop or rebuild the in-flight batch.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

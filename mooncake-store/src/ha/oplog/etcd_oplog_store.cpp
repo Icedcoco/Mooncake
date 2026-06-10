@@ -250,23 +250,52 @@ void EtcdOpLogStore::FlushBatch() {
             break;
         }
         if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
-            // BatchCreate uses Txn(If all keys CreateRevision==0).
-            // Transaction failure means some keys already exist — likely
-            // from a previous attempt that timed out but actually succeeded
-            // on the etcd side. Since OpLog entries are idempotent (same
-            // sequence_id -> same key/value), we can safely fall back to
-            // individual Put (overwrite) for the remaining keys.
+            // Stage 3 fix: BatchCreate uses Txn(If all keys CreateRevision==0).
+            // Transaction failure means some keys already exist. The previous
+            // (legacy) fallback blindly overwrote with Put, which silently
+            // destroyed any pre-existing value at the same sequence_id. The
+            // basic-available contract (plan §6.4) requires read-and-compare:
+            // if the existing value equals what we are about to write, it is
+            // an idempotent retry; if it differs, we must NOT overwrite —
+            // that would corrupt the durable history.
             LOG(WARNING)
                 << "BatchCreate transaction failed (keys already exist), "
-                << "falling back to per-key Put for " << keys.size()
+                << "falling back to read-and-compare for " << keys.size()
                 << " entries";
             bool all_ok = true;
             for (size_t j = 0; j < keys.size(); ++j) {
+                std::string existing_value;
+                EtcdRevisionId existing_rev = 0;
+                ErrorCode get_err =
+                    EtcdHelper::Get(keys[j].c_str(), keys[j].size(),
+                                    existing_value, existing_rev);
+                if (get_err == ErrorCode::OK) {
+                    if (existing_value == values[j]) {
+                        // Idempotent retry — same sequence_id, same payload.
+                        continue;
+                    }
+                    LOG(ERROR)
+                        << "Refusing to overwrite pre-existing OpLog entry:"
+                        << " key=" << keys[j]
+                        << " (existing payload differs from incoming)";
+                    all_ok = false;
+                    continue;
+                }
+                if (get_err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+                    // Race: the key vanished between the BatchCreate attempt
+                    // and our Get. Fall through to Put to materialize it.
+                } else {
+                    LOG(ERROR) << "Fallback Get failed for key=" << keys[j]
+                               << " (err=" << get_err << ")";
+                    all_ok = false;
+                    continue;
+                }
                 ErrorCode put_err =
                     EtcdHelper::Put(keys[j].c_str(), keys[j].size(),
                                     values[j].c_str(), values[j].size());
                 if (put_err != ErrorCode::OK) {
-                    LOG(ERROR) << "Fallback Put failed for key=" << keys[j];
+                    LOG(ERROR) << "Fallback Put failed for key=" << keys[j]
+                               << " (err=" << put_err << ")";
                     all_ok = false;
                 }
             }
@@ -418,8 +447,12 @@ ErrorCode EtcdOpLogStore::ReadOpLogSinceWithRevision(
         for (const auto& kv : root) {
             const std::string key = kv.get("key", "").asString();
             last_key_in_page = key;
+            // Stage 3: also skip the durable batch namespace so legacy
+            // sequence readers never try to deserialize an OpLogBatchRecord
+            // as an OpLogEntry.
             if (key.empty() || key.find("/latest") != std::string::npos ||
-                key.find("/snapshot/") != std::string::npos) {
+                key.find("/snapshot/") != std::string::npos ||
+                key.find("/shards/") != std::string::npos) {
                 continue;
             }
 
@@ -576,11 +609,13 @@ std::optional<uint64_t> EtcdOpLogStore::GetMinSequenceId() const {
         return std::nullopt;
     }
 
-    // Skip non-entry keys if any (e.g. "/latest" or "/snapshot/...").
+    // Skip non-entry keys if any (e.g. "/latest", "/snapshot/...", or the
+    // Stage 3 batch namespace under "/shards/").
     // Entries are expected to be ".../<20-digit-seq>".
     // If the first key isn't an entry key, fall back to nullopt (safe no-op).
     if (first_key.find("/latest") != std::string::npos ||
-        first_key.find("/snapshot/") != std::string::npos) {
+        first_key.find("/snapshot/") != std::string::npos ||
+        first_key.find("/shards/") != std::string::npos) {
         return std::nullopt;
     }
 
@@ -632,6 +667,398 @@ std::string EtcdOpLogStore::BuildSnapshotKey(
     oss << kOpLogPrefix << cluster_id_ << kSnapshotSuffix << snapshot_id
         << "/sequence_id";
     return oss.str();
+}
+
+// ---------- Stage 3: durable batch namespace ----------
+
+std::string EtcdOpLogStore::BuildBatchKey(uint32_t shard_id,
+                                          uint64_t batch_id) const {
+    // 20-digit zero-padded batch_id so lexicographic order == numeric order,
+    // which lets ReadBatchesSince use a simple range scan.
+    std::ostringstream oss;
+    oss << kOpLogPrefix << cluster_id_ << kShardsPrefix << shard_id
+        << kBatchesSuffix << std::setw(20) << std::setfill('0') << batch_id;
+    return oss.str();
+}
+
+std::string EtcdOpLogStore::BuildLatestBatchKey(uint32_t shard_id) const {
+    std::ostringstream oss;
+    oss << kOpLogPrefix << cluster_id_ << kShardsPrefix << shard_id
+        << kLatestBatchSuffix;
+    return oss.str();
+}
+
+std::string EtcdOpLogStore::EncodeLatestBatchValue(
+    uint64_t batch_id, const std::string& owner_token) {
+    // '|' is safe as a separator because owner_token comes from
+    // EtcdLeaderCoordinator::MakeOwnerToken, which encodes the lease id as a
+    // decimal string. Tests in Stage 3 also pass plain ASCII tokens.
+    return std::to_string(batch_id) + "|" + owner_token;
+}
+
+bool EtcdOpLogStore::ParseLatestBatchValue(const std::string& value,
+                                           uint64_t& batch_id,
+                                           std::string& owner_token) {
+    auto pos = value.find('|');
+    if (pos == std::string::npos) {
+        return false;
+    }
+    try {
+        batch_id = std::stoull(value.substr(0, pos));
+    } catch (const std::exception&) {
+        return false;
+    }
+    owner_token = value.substr(pos + 1);
+    return true;
+}
+
+ErrorCode EtcdOpLogStore::ReadLatestBatchValue(uint32_t shard_id,
+                                               uint64_t& batch_id,
+                                               std::string& owner_token) {
+    batch_id = 0;
+    owner_token.clear();
+    std::string key = BuildLatestBatchKey(shard_id);
+    std::string value;
+    EtcdRevisionId revision_id = 0;
+    ErrorCode err =
+        EtcdHelper::Get(key.c_str(), key.size(), value, revision_id);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        // No batches yet for this shard — treat as "latest_batch=0, no
+        // recorded leader token". This is the documented empty-shard
+        // contract.
+        return ErrorCode::OK;
+    }
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (!ParseLatestBatchValue(value, batch_id, owner_token)) {
+        LOG(ERROR) << "Corrupt latest_batch value under " << key
+                   << " (value=" << value << ")";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdOpLogStore::CompareBatchRecord(uint32_t shard_id,
+                                             uint64_t batch_id,
+                                             const OpLogBatchRecord& expected) {
+    std::string key = BuildBatchKey(shard_id, batch_id);
+    std::string value;
+    EtcdRevisionId revision_id = 0;
+    ErrorCode err =
+        EtcdHelper::Get(key.c_str(), key.size(), value, revision_id);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    }
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    OpLogBatchRecord existing;
+    if (!mooncake::DeserializeOpLogBatchRecord(value, existing)) {
+        LOG(ERROR) << "Failed to deserialize batch record at " << key
+                   << " during CompareBatchRecord";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // Re-serialize both sides with a normalized checksum and compare JSON
+    // byte-for-byte. This catches every field difference (including
+    // producer_view_version and entry-level local_index gaps) while being
+    // robust to JsonCpp key ordering.
+    if (existing.shard_id != expected.shard_id ||
+        existing.batch_id != expected.batch_id ||
+        existing.producer_view_version != expected.producer_view_version ||
+        existing.owner_token != expected.owner_token ||
+        existing.entries.size() != expected.entries.size() ||
+        existing.batch_checksum != expected.batch_checksum) {
+        return ErrorCode::SEQUENCE_CONFLICT;
+    }
+    for (size_t i = 0; i < existing.entries.size(); ++i) {
+        const auto& a = existing.entries[i];
+        const auto& b = expected.entries[i];
+        if (a.sequence_id != b.sequence_id ||
+            a.timestamp_ms != b.timestamp_ms || a.op_type != b.op_type ||
+            a.tenant_id != b.tenant_id || a.object_key != b.object_key ||
+            a.payload != b.payload || a.checksum != b.checksum ||
+            a.prefix_hash != b.prefix_hash || a.shard_id != b.shard_id ||
+            a.batch_id != b.batch_id || a.local_index != b.local_index) {
+            return ErrorCode::SEQUENCE_CONFLICT;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdOpLogStore::AppendBatch(const OpLogBatchRecord& batch) {
+    // 1. Caller must have populated batch_checksum via
+    //    ComputeOpLogBatchChecksum. Anything else is a programming error
+    //    and we surface it as INTERNAL_ERROR rather than silently writing
+    //    a bad record.
+    if (batch.entries.empty()) {
+        LOG(ERROR) << "AppendBatch rejected: batch has no entries"
+                   << " (shard=" << batch.shard_id
+                   << ", batch_id=" << batch.batch_id << ")";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (batch.batch_checksum != mooncake::ComputeOpLogBatchChecksum(batch)) {
+        LOG(ERROR) << "AppendBatch rejected: batch_checksum mismatch"
+                   << " (shard=" << batch.shard_id
+                   << ", batch_id=" << batch.batch_id << ")";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    // Basic-available HA is single-shard. Refuse other shard_ids explicitly
+    // so multi-shard misuse is loud rather than silently accepted.
+    if (batch.shard_id != 0) {
+        LOG(ERROR) << "AppendBatch rejected: non-zero shard_id is not"
+                   << " supported in basic-available HA (shard="
+                   << batch.shard_id << ")";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    // 2. Read latest_batch and enforce the (batch_id, owner_token) invariants.
+    uint64_t current_batch_id = 0;
+    std::string current_token;
+    ErrorCode latest_err =
+        ReadLatestBatchValue(batch.shard_id, current_batch_id, current_token);
+    if (latest_err != ErrorCode::OK) {
+        return latest_err;
+    }
+    const bool latest_present = (current_batch_id != 0);
+
+    if (!latest_present) {
+        // No durable history yet for this shard. The first batch MUST be
+        // batch_id=1.
+        if (batch.batch_id != 1) {
+            LOG(ERROR) << "AppendBatch rejected: no latest_batch yet but"
+                       << " incoming batch_id=" << batch.batch_id
+                       << " (expected 1)";
+            return ErrorCode::SEQUENCE_CONFLICT;
+        }
+    } else {
+        if (batch.batch_id == current_batch_id) {
+            // Same batch_id as the durable one. If everything matches, this
+            // is an idempotent retry; otherwise it's a conflict. CompareBatch
+            // Record returns OK on equal, SEQUENCE_CONFLICT on differ.
+            ErrorCode cmp =
+                CompareBatchRecord(batch.shard_id, batch.batch_id, batch);
+            if (cmp == ErrorCode::OK) {
+                return ErrorCode::OK;
+            }
+            if (cmp == ErrorCode::SEQUENCE_CONFLICT) {
+                return ErrorCode::SEQUENCE_CONFLICT;
+            }
+            return cmp;
+        }
+        if (batch.batch_id <= current_batch_id) {
+            // Strictly behind the durable pointer. Reject as a stale write —
+            // there is no durable reason to rewind the batch id space.
+            LOG(ERROR) << "AppendBatch rejected: incoming batch_id="
+                       << batch.batch_id
+                       << " is behind latest_batch=" << current_batch_id;
+            return ErrorCode::SEQUENCE_CONFLICT;
+        }
+        if (batch.batch_id != current_batch_id + 1) {
+            LOG(ERROR) << "AppendBatch rejected: gap between latest_batch="
+                       << current_batch_id
+                       << " and incoming batch_id=" << batch.batch_id;
+            return ErrorCode::SEQUENCE_CONFLICT;
+        }
+        if (current_token != batch.owner_token) {
+            LOG(ERROR) << "AppendBatch rejected: owner_token mismatch"
+                       << " (latest_token='" << current_token
+                       << "', incoming_token='" << batch.owner_token
+                       << "', batch_id=" << batch.batch_id << ")";
+            return ErrorCode::STALE_LEADER;
+        }
+    }
+
+    // 3. Pre-check the batch key. If a record already exists at this
+    // (shard, batch_id), it must be byte-identical to what we are about to
+    // write. This is the idempotent-retry / conflict path BEFORE the
+    // Create so we don't need to roll back on the next step.
+    {
+        ErrorCode pre_cmp =
+            CompareBatchRecord(batch.shard_id, batch.batch_id, batch);
+        if (pre_cmp == ErrorCode::OK) {
+            // Same payload already durable — idempotent retry.
+            return ErrorCode::OK;
+        }
+        if (pre_cmp != ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
+            return pre_cmp;
+        }
+    }
+
+    // 4. Atomically create the batch record. CreateRevision==0 is etcd's
+    // "key must not exist" gate — if two leaders race, only one wins.
+    const std::string batch_key = BuildBatchKey(batch.shard_id, batch.batch_id);
+    const std::string batch_value = mooncake::SerializeOpLogBatchRecord(batch);
+    ErrorCode create_err =
+        EtcdHelper::Create(batch_key.c_str(), batch_key.size(),
+                           batch_value.c_str(), batch_value.size());
+    if (create_err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        // Lost the race. Re-read and compare: same payload → idempotent OK,
+        // different payload → SEQUENCE_CONFLICT.
+        ErrorCode post_cmp =
+            CompareBatchRecord(batch.shard_id, batch.batch_id, batch);
+        if (post_cmp == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+        return (post_cmp == ErrorCode::OPLOG_ENTRY_NOT_FOUND)
+                   ? ErrorCode::ETCD_TRANSACTION_FAIL
+                   : post_cmp;
+    }
+    if (create_err != ErrorCode::OK) {
+        return create_err;
+    }
+
+    // 5. Advance the latest_batch pointer. We do this as a plain Put rather
+    // than a true multi-key Txn: a concurrent leader that races this step
+    // will be caught by the owner_token check on the next AppendBatch call
+    // (their write will see our (batch_id, token) and either advance further
+    // or be rejected as stale). The atomicity here is "best effort"; the
+    // durable invariant is that any visible (batch_key, batch_id) record
+    // implies latest_batch >= batch_id once the dust settles.
+    const std::string latest_key = BuildLatestBatchKey(batch.shard_id);
+    const std::string latest_value =
+        EncodeLatestBatchValue(batch.batch_id, batch.owner_token);
+    ErrorCode put_err =
+        EtcdHelper::Put(latest_key.c_str(), latest_key.size(),
+                        latest_value.c_str(), latest_value.size());
+    if (put_err != ErrorCode::OK) {
+        LOG(ERROR) << "AppendBatch: batch key written but latest_batch"
+                   << " update failed (key=" << batch_key << ", err=" << put_err
+                   << "). A later read will see a"
+                   << " batch record without a matching latest_batch pointer"
+                   << " until the next successful AppendBatch call.";
+        // Best-effort: do not undo the batch record. The caller / next
+        // AppendBatch will repair the pointer on success.
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdOpLogStore::ReadBatch(uint32_t shard_id, uint64_t batch_id,
+                                    OpLogBatchRecord& batch) {
+    std::string key = BuildBatchKey(shard_id, batch_id);
+    std::string value;
+    EtcdRevisionId revision_id = 0;
+    ErrorCode err =
+        EtcdHelper::Get(key.c_str(), key.size(), value, revision_id);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    }
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (!mooncake::DeserializeOpLogBatchRecord(value, batch)) {
+        LOG(ERROR) << "Failed to deserialize batch record at " << key;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdOpLogStore::ReadBatchesSince(
+    uint32_t shard_id, uint64_t start_batch_id, size_t limit,
+    std::vector<OpLogBatchRecord>& batches) {
+    batches.clear();
+    if (limit == 0) {
+        return ErrorCode::OK;
+    }
+
+    // Range scan over the fixed-width 20-digit batch key, starting just past
+    // start_batch_id. We use the same GetRangeAsJson pipeline as the legacy
+    // sequence scan because it gives us page-level revision metadata and
+    // avoids the C++/Go memory juggling that a per-key Get would require.
+    std::ostringstream prefix_oss;
+    prefix_oss << kOpLogPrefix << cluster_id_ << kShardsPrefix << shard_id
+               << kBatchesSuffix;
+    const std::string prefix = prefix_oss.str();
+
+    auto prefix_end = [](std::string p) -> std::string {
+        for (int i = static_cast<int>(p.size()) - 1; i >= 0; --i) {
+            unsigned char c = static_cast<unsigned char>(p[i]);
+            if (c < 0xFF) {
+                p[i] = static_cast<char>(c + 1);
+                p.resize(i + 1);
+                return p;
+            }
+        }
+        return std::string(1, '\0');
+    };
+    const std::string end_key = prefix_end(prefix);
+
+    // Build start key as the prefix + 20-digit (start_batch_id + 1), so the
+    // scan is naturally exclusive of start_batch_id and inclusive of the
+    // next batch.
+    std::ostringstream start_oss;
+    start_oss << prefix << std::setw(20) << std::setfill('0')
+              << (start_batch_id + 1);
+    std::string current_start_key = start_oss.str();
+
+    while (batches.size() < limit) {
+        const size_t page_limit = limit - batches.size();
+        std::string json;
+        EtcdRevisionId page_rev = 0;
+        ErrorCode err = EtcdHelper::GetRangeAsJson(
+            current_start_key.c_str(), current_start_key.size(),
+            end_key.c_str(), end_key.size(), page_limit, json, page_rev);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        if (json.empty()) {
+            break;
+        }
+
+        Json::Value root;
+        Json::CharReaderBuilder reader;
+        std::string errs;
+        std::istringstream s(json);
+        if (!Json::parseFromStream(reader, s, &root, &errs)) {
+            LOG(ERROR) << "Failed to parse range JSON in ReadBatchesSince: "
+                       << errs;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (!root.isArray() || root.empty()) {
+            break;
+        }
+
+        std::string last_key_in_page;
+        for (const auto& kv : root) {
+            const std::string key = kv.get("key", "").asString();
+            last_key_in_page = key;
+            const std::string value = kv.get("value", "").asString();
+
+            // Defensive: skip anything that isn't under the batch prefix.
+            if (key.rfind(prefix, 0) != 0) {
+                continue;
+            }
+
+            OpLogBatchRecord batch;
+            if (!mooncake::DeserializeOpLogBatchRecord(value, batch)) {
+                LOG(ERROR) << "Failed to deserialize batch record from key="
+                           << key;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            batches.push_back(std::move(batch));
+            if (batches.size() >= limit) {
+                break;
+            }
+        }
+
+        if (last_key_in_page.empty()) {
+            break;
+        }
+        // Advance start for next page: one byte past last_key_in_page.
+        current_start_key = last_key_in_page;
+        current_start_key.push_back('\0');
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdOpLogStore::GetLatestBatchId(uint32_t shard_id,
+                                           uint64_t& batch_id) {
+    std::string token;
+    return ReadLatestBatchValue(shard_id, batch_id, token);
 }
 
 std::unique_ptr<OpLogChangeNotifier> EtcdOpLogStore::CreateChangeNotifier(

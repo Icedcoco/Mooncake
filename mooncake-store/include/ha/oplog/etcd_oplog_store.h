@@ -134,6 +134,33 @@ class EtcdOpLogStore : public OpLogStore {
      */
     ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id) override;
 
+    // ------------------------------------------------------------------
+    // Stage 3: durable batch record API.
+    //
+    // Implements the etcd half of the contract defined in plan §6:
+    //   - key schema:  /oplog/{cluster}/shards/{shard}/batches/{batch_id:020d}
+    //                  /oplog/{cluster}/shards/{shard}/latest_batch
+    //   - AppendBatch: enforces batch_id == latest_batch + 1, owner_token
+    //                  continuity against the durable history, idempotent
+    //                  retry of the same payload, and rejection of
+    //                  same-batch-id with a different payload.
+    //   - latest_batch value format: "<batch_id>|<owner_token>" (the
+    //                  '|' separator is safe because owner_token is the
+    //                  etcd lease id encoded as a decimal string by
+    //                  EtcdLeaderCoordinator::MakeOwnerToken).
+    // ------------------------------------------------------------------
+
+    ErrorCode AppendBatch(const OpLogBatchRecord& batch) override;
+
+    ErrorCode ReadBatch(uint32_t shard_id, uint64_t batch_id,
+                        OpLogBatchRecord& batch) override;
+
+    ErrorCode ReadBatchesSince(uint32_t shard_id, uint64_t start_batch_id,
+                               size_t limit,
+                               std::vector<OpLogBatchRecord>& batches) override;
+
+    ErrorCode GetLatestBatchId(uint32_t shard_id, uint64_t& batch_id) override;
+
     // Create an EtcdOpLogChangeNotifier backed by this store.
     std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
         const std::string& cluster_id) override;
@@ -158,6 +185,36 @@ class EtcdOpLogStore : public OpLogStore {
      * @return: The etcd key.
      */
     std::string BuildSnapshotKey(const std::string& snapshot_id) const;
+
+    // Stage 3: build the etcd key for a batch record under
+    // /oplog/{cluster}/shards/{shard}/batches/{batch_id:020d}.
+    std::string BuildBatchKey(uint32_t shard_id, uint64_t batch_id) const;
+
+    // Stage 3: build the etcd key for the latest_batch pointer under
+    // /oplog/{cluster}/shards/{shard}/latest_batch.
+    std::string BuildLatestBatchKey(uint32_t shard_id) const;
+
+    // Stage 3: encode / parse the latest_batch value of the form
+    // "<batch_id>|<owner_token>". Returns false on any malformation.
+    static std::string EncodeLatestBatchValue(uint64_t batch_id,
+                                              const std::string& owner_token);
+    static bool ParseLatestBatchValue(const std::string& value,
+                                      uint64_t& batch_id,
+                                      std::string& owner_token);
+
+    // Stage 3: read the latest_batch value (if any) for the given shard.
+    // Returns OK with batch_id=0 and owner_token empty when the shard has no
+    // batches yet; returns OPLOG_ENTRY_NOT_FOUND only for true backend
+    // failures that prevent the read.
+    ErrorCode ReadLatestBatchValue(uint32_t shard_id, uint64_t& batch_id,
+                                   std::string& owner_token);
+
+    // Stage 3: read the durable batch record at (shard_id, batch_id) and
+    // compare it byte-for-byte (after deserialization) against `expected`.
+    // Returns OK if the records are equal, SEQUENCE_CONFLICT if they differ,
+    // OPLOG_ENTRY_NOT_FOUND if the key is absent.
+    ErrorCode CompareBatchRecord(uint32_t shard_id, uint64_t batch_id,
+                                 const OpLogBatchRecord& expected);
 
     // Best-effort: find the minimum existing OpLog sequence_id in etcd.
     // Used for robust cleanup (Scheme 3) so we don't rely on a persisted
@@ -188,6 +245,12 @@ class EtcdOpLogStore : public OpLogStore {
     static constexpr const char* kLatestSuffix = "/latest";
     static constexpr const char* kSnapshotPrefix = "/oplog/";
     static constexpr const char* kSnapshotSuffix = "/snapshot/";
+    // Stage 3: durable batch namespace. The single leading slash after
+    // cluster_id_ is what allows the legacy range scan to filter it out
+    // without also matching /latest (see ReadOpLogSinceWithRevision).
+    static constexpr const char* kShardsPrefix = "/shards/";
+    static constexpr const char* kBatchesSuffix = "/batches/";
+    static constexpr const char* kLatestBatchSuffix = "/latest_batch";
 
     // Batch update mechanism for latest_sequence_id
     const bool enable_latest_seq_batch_update_{false};
