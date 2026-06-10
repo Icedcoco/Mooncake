@@ -18,6 +18,17 @@
 namespace mooncake {
 namespace ha {
 
+ErrorCode ValidateMasterServiceSupervisorHAConfig(
+    const MasterServiceSupervisorConfig& config) {
+    HACapabilityConfig capability;
+    capability.ha_required_level = config.ha_required_level;
+    capability.ha_backend_type = config.ha_backend_type;
+    capability.ha_oplog_format = config.ha_oplog_format;
+    capability.ha_oplog_shard_count = config.ha_oplog_shard_count;
+    capability.ha_put_end_commit_mode = config.ha_put_end_commit_mode;
+    return ValidateHACapabilityConfig(capability);
+}
+
 namespace {
 
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
@@ -470,6 +481,19 @@ MasterServiceSupervisor::MasterServiceSupervisor(
     : config_(config) {}
 
 int MasterServiceSupervisor::Start() {
+    auto capability_err = ValidateMasterServiceSupervisorHAConfig(config_);
+    if (capability_err != ErrorCode::OK) {
+        LOG(ERROR) << "HA capability gate rejected config: "
+                   << toString(capability_err)
+                   << ", required_level=" << config_.ha_required_level
+                   << ", backend_type=" << config_.ha_backend_type
+                   << ", oplog_format=" << config_.ha_oplog_format
+                   << ", shard_count=" << config_.ha_oplog_shard_count
+                   << ", put_end_commit_mode="
+                   << config_.ha_put_end_commit_mode;
+        return -1;
+    }
+
     auto spec = BuildHABackendSpec(config_);
     if (!spec) {
         LOG(ERROR) << "Failed to parse HA backend config: "

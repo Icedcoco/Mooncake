@@ -52,6 +52,14 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
+    // HA capability gate (Stage 1). Default values match the legacy
+    // single-entry oplog path so that no production behavior changes
+    // unless an operator opts in to "full".
+    std::string ha_required_level = "degraded";
+    std::string ha_oplog_format = "legacy_sequence";
+    uint32_t ha_oplog_shard_count = 1;
+    std::string ha_put_end_commit_mode = "async";
+
     // OpLog store configuration
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
@@ -156,6 +164,11 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    // HA capability gate (Stage 1). Defaults preserve the legacy path.
+    std::string ha_required_level = "degraded";
+    std::string ha_oplog_format = "legacy_sequence";
+    uint32_t ha_oplog_shard_count = 1;
+    std::string ha_put_end_commit_mode = "async";
     // OpLog store configuration
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
@@ -238,6 +251,10 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        ha_required_level = config.ha_required_level;
+        ha_oplog_format = config.ha_oplog_format;
+        ha_oplog_shard_count = config.ha_oplog_shard_count;
+        ha_put_end_commit_mode = config.ha_put_end_commit_mode;
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;

@@ -145,14 +145,17 @@ target_link_libraries(
          gtest_main
          pthread)
 if(STORE_USE_K8S_LEASE)
-  target_link_libraries(high_availability_test
-                        PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+  target_link_libraries(high_availability_test PRIVATE ${K8S_LEASE_WRAPPER_LIB})
 endif()
-if(STORE_USE_ETCD OR STORE_USE_REDIS OR STORE_USE_K8S_LEASE)
+if(STORE_USE_ETCD
+   OR STORE_USE_REDIS
+   OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 add_ha_test(ha_backend_availability_test
             ha/leadership/ha_backend_availability_test.cpp)
+add_ha_test(ha_capability_config_test
+            ha/leadership/ha_capability_config_test.cpp)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(
