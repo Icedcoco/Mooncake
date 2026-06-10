@@ -355,6 +355,39 @@ TEST_F(OpLogManagerTest, RetryPreservesSequenceId) {
     EXPECT_EQ(1u, manager_->GetLastSequenceId());
 }
 
+// ===========================================================================
+// Stage 2: OpLogStore base-class batch API contract (plan §5.3 RED test 5,
+// §5.4 GREEN). Backends that have not opted into batch storage MUST return
+// UNAVAILABLE_IN_CURRENT_MODE from every batch method, never CRASH or return
+// OK. MockOpLogStore deliberately leaves the batch methods unimplemented so
+// that we exercise the base-class default, which is what older backends
+// (localfs, legacy etcd schema) will fall through to until Stage 3 wires up
+// real implementations.
+// ===========================================================================
+TEST(OpLogStoreBaseBatchApiTest,
+     BaseOpLogStoreBatchMethodsReturnUnavailableByDefault) {
+    MockOpLogStore mock;
+    OpLogStore& base = mock;  // exercise the base-class virtuals.
+
+    OpLogBatchRecord append_batch;
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+              base.AppendBatch(append_batch));
+
+    OpLogBatchRecord read_out;
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+              base.ReadBatch(/*shard_id=*/0, /*batch_id=*/0, read_out));
+
+    std::vector<OpLogBatchRecord> batches;
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+              base.ReadBatchesSince(/*shard_id=*/0, /*start_batch_id=*/0,
+                                    /*limit=*/16, batches));
+    EXPECT_TRUE(batches.empty());
+
+    uint64_t latest_batch = 99;
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+              base.GetLatestBatchId(/*shard_id=*/0, latest_batch));
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

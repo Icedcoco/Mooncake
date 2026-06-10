@@ -10,6 +10,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/ha_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -84,6 +85,44 @@ struct OpLogEntry {
     uint32_t checksum{0};  // Checksum of payload (implementation-defined)
     uint32_t prefix_hash{
         0};  // Hash of the entire key (for verification and optimization)
+
+    // Stage 2 batch coordinates. These are 0-valued for entries produced by
+    // the legacy single-entry path (durable truth is still sequence_id in
+    // that mode). When the entry is produced by a batched LogWriter (Stage 4
+    // and beyond), shard_id/batch_id identify the durable batch record this
+    // entry belongs to, and local_index is the entry's 0-based position
+    // within that batch. Older on-the-wire payloads without these fields
+    // continue to parse, with the fields defaulting to 0 on the consumer.
+    uint32_t shard_id{0};
+    uint64_t batch_id{0};
+    uint32_t local_index{0};
+};
+
+// Stage 2: durable position of a single OpLog entry inside the batched
+// history. Once Stage 4 swaps the write path to batched mode, this triple
+// becomes the canonical "where in the durable log" identifier, replacing
+// the role currently played by sequence_id alone. The struct is intentionally
+// a plain value type so it can be passed by value, compared, and stored
+// without lifetime concerns.
+struct OpLogBatchPosition {
+    uint32_t shard_id{0};
+    uint64_t batch_id{0};
+    uint32_t local_index{0};
+};
+
+// Stage 2: durable batch record. One of these is what an etcd batch backend
+// (Stage 3) writes as a single transactional record, what the LogWriter
+// (Stage 4) builds in memory before flushing, and what standby replay
+// (Stage 5) consumes one batch at a time. The batch_checksum covers the
+// batch header plus the stable fields of every entry; per-entry payload
+// integrity continues to be guarded by OpLogEntry::checksum.
+struct OpLogBatchRecord {
+    uint32_t shard_id{0};
+    uint64_t batch_id{0};
+    ViewVersionId producer_view_version{0};
+    ha::OwnerToken owner_token;
+    std::vector<OpLogEntry> entries;
+    uint32_t batch_checksum{0};
 };
 
 /**
