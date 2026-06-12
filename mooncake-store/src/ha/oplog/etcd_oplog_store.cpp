@@ -688,50 +688,37 @@ std::string EtcdOpLogStore::BuildLatestBatchKey(uint32_t shard_id) const {
     return oss.str();
 }
 
-std::string EtcdOpLogStore::EncodeLatestBatchValue(
-    uint64_t batch_id, const std::string& owner_token) {
-    // '|' is safe as a separator because owner_token comes from
-    // EtcdLeaderCoordinator::MakeOwnerToken, which encodes the lease id as a
-    // decimal string. Tests in Stage 3 also pass plain ASCII tokens.
-    return std::to_string(batch_id) + "|" + owner_token;
+std::string EtcdOpLogStore::EncodeLatestBatchValue(uint64_t batch_id) {
+    return std::to_string(batch_id);
 }
 
 bool EtcdOpLogStore::ParseLatestBatchValue(const std::string& value,
-                                           uint64_t& batch_id,
-                                           std::string& owner_token) {
-    auto pos = value.find('|');
-    if (pos == std::string::npos) {
-        return false;
-    }
+                                           uint64_t& batch_id) {
     try {
-        batch_id = std::stoull(value.substr(0, pos));
+        batch_id = std::stoull(value);
     } catch (const std::exception&) {
         return false;
     }
-    owner_token = value.substr(pos + 1);
     return true;
 }
 
 ErrorCode EtcdOpLogStore::ReadLatestBatchValue(uint32_t shard_id,
-                                               uint64_t& batch_id,
-                                               std::string& owner_token) {
+                                               uint64_t& batch_id) {
     batch_id = 0;
-    owner_token.clear();
     std::string key = BuildLatestBatchKey(shard_id);
     std::string value;
     EtcdRevisionId revision_id = 0;
     ErrorCode err =
         EtcdHelper::Get(key.c_str(), key.size(), value, revision_id);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
-        // No batches yet for this shard — treat as "latest_batch=0, no
-        // recorded leader token". This is the documented empty-shard
-        // contract.
+        // No batches yet for this shard — treat as "latest_batch=0".
+        // This is the documented empty-shard contract.
         return ErrorCode::OK;
     }
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!ParseLatestBatchValue(value, batch_id, owner_token)) {
+    if (!ParseLatestBatchValue(value, batch_id)) {
         LOG(ERROR) << "Corrupt latest_batch value under " << key
                    << " (value=" << value << ")";
         return ErrorCode::INTERNAL_ERROR;
@@ -765,10 +752,15 @@ ErrorCode EtcdOpLogStore::CompareBatchRecord(uint32_t shard_id,
     // byte-for-byte. This catches every field difference (including
     // producer_view_version and entry-level local_index gaps) while being
     // robust to JsonCpp key ordering.
+    //
+    // NOTE: owner_token is intentionally NOT compared here. The
+    // /latest_batch pointer does not record owner_token, and a legitimate
+    // new leader must be allowed to write a different owner_token than the
+    // previous leader. Comparing it here would re-introduce the
+    // STALE_LEADER-after-failover bug.
     if (existing.shard_id != expected.shard_id ||
         existing.batch_id != expected.batch_id ||
         existing.producer_view_version != expected.producer_view_version ||
-        existing.owner_token != expected.owner_token ||
         existing.entries.size() != expected.entries.size() ||
         existing.batch_checksum != expected.batch_checksum) {
         return ErrorCode::SEQUENCE_CONFLICT;
@@ -814,11 +806,16 @@ ErrorCode EtcdOpLogStore::AppendBatch(const OpLogBatchRecord& batch) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    // 2. Read latest_batch and enforce the (batch_id, owner_token) invariants.
+    // 2. Read latest_batch and enforce the batch_id continuity invariant.
+    //
+    // IMPORTANT: we do NOT compare owner_token here. A legitimate new leader
+    // (with a fresh lease_id after failover) must be able to continue the
+    // batch_id sequence regardless of the token the previous leader used.
+    // Real fencing is enforced at a higher layer (Stage 6 promotion gate /
+    // LogWriter session injection) — not by /latest_batch content.
     uint64_t current_batch_id = 0;
-    std::string current_token;
     ErrorCode latest_err =
-        ReadLatestBatchValue(batch.shard_id, current_batch_id, current_token);
+        ReadLatestBatchValue(batch.shard_id, current_batch_id);
     if (latest_err != ErrorCode::OK) {
         return latest_err;
     }
@@ -861,13 +858,6 @@ ErrorCode EtcdOpLogStore::AppendBatch(const OpLogBatchRecord& batch) {
                        << current_batch_id
                        << " and incoming batch_id=" << batch.batch_id;
             return ErrorCode::SEQUENCE_CONFLICT;
-        }
-        if (current_token != batch.owner_token) {
-            LOG(ERROR) << "AppendBatch rejected: owner_token mismatch"
-                       << " (latest_token='" << current_token
-                       << "', incoming_token='" << batch.owner_token
-                       << "', batch_id=" << batch.batch_id << ")";
-            return ErrorCode::STALE_LEADER;
         }
     }
 
@@ -912,14 +902,13 @@ ErrorCode EtcdOpLogStore::AppendBatch(const OpLogBatchRecord& batch) {
 
     // 5. Advance the latest_batch pointer. We do this as a plain Put rather
     // than a true multi-key Txn: a concurrent leader that races this step
-    // will be caught by the owner_token check on the next AppendBatch call
-    // (their write will see our (batch_id, token) and either advance further
-    // or be rejected as stale). The atomicity here is "best effort"; the
-    // durable invariant is that any visible (batch_key, batch_id) record
-    // implies latest_batch >= batch_id once the dust settles.
+    // will be caught by the batch_id-gap check on the next AppendBatch call
+    // (their write will see our batch_id and either advance further or be
+    // rejected as a gap). The atomicity here is "best effort"; the durable
+    // invariant is that any visible (batch_key, batch_id) record implies
+    // latest_batch >= batch_id once the dust settles.
     const std::string latest_key = BuildLatestBatchKey(batch.shard_id);
-    const std::string latest_value =
-        EncodeLatestBatchValue(batch.batch_id, batch.owner_token);
+    const std::string latest_value = EncodeLatestBatchValue(batch.batch_id);
     ErrorCode put_err =
         EtcdHelper::Put(latest_key.c_str(), latest_key.size(),
                         latest_value.c_str(), latest_value.size());
@@ -1057,8 +1046,7 @@ ErrorCode EtcdOpLogStore::ReadBatchesSince(
 
 ErrorCode EtcdOpLogStore::GetLatestBatchId(uint32_t shard_id,
                                            uint64_t& batch_id) {
-    std::string token;
-    return ReadLatestBatchValue(shard_id, batch_id, token);
+    return ReadLatestBatchValue(shard_id, batch_id);
 }
 
 std::unique_ptr<OpLogChangeNotifier> EtcdOpLogStore::CreateChangeNotifier(

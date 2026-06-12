@@ -407,14 +407,13 @@ TEST_F(EtcdOpLogStoreTest, TestReadOpLogSince_LargeDataset) {
 // These tests exercise the durable batch record contract defined in plan §6:
 //   - key schema:  /oplog/{cluster}/shards/{shard}/batches/{batch_id:020d}
 //                  /oplog/{cluster}/shards/{shard}/latest_batch
-//   - AppendBatch: compare latest_batch == N AND owner_token ==
-//   batch.owner_token
-//                  THEN put batch N+1 AND put latest_batch = N+1
-//   - idempotency: re-AppendBatch with the same payload is OK
-//   - conflict:    re-AppendBatch with the same batch_id but different payload
-//                  is rejected, and the durable state is unchanged
-//   - stale leader: a batch with an owner_token that does not match the
-//                   durable latest_batch is rejected
+//   - latest_batch value format: plain decimal "<batch_id>" string
+//   - AppendBatch: compare latest_batch == N; put batch N+1 AND put
+//                  latest_batch = N+1; idempotent retry of the same payload
+//                  returns OK; same batch_id with a different payload
+//                  returns SEQUENCE_CONFLICT; a new leader with a different
+//                  owner_token may continue the sequence (no per-batch
+//                  token fencing here — that's Stage 6's job)
 //   - legacy group commit fallback: WriteOpLog must NOT blindly overwrite a
 //                                   pre-existing sequence value with a
 //                                   different payload
@@ -612,30 +611,60 @@ TEST_F(EtcdOpLogStoreTest,
     EXPECT_EQ(1u, latest);
 }
 
-// AppendBatchRejectsStaleLeaderToken
+// AppendBatchAcceptsNewLeaderAfterFailover
 //
-// After batch 1 has been durably written by leader-A (owner_token=A), a batch
-// with a different owner_token is rejected as stale. The owner_token check is
-// the per-batch fencing gate that prevents a revoked leader from sneaking in
-// writes against the durable history.
-TEST_F(EtcdOpLogStoreTest, Stage3_AppendBatchRejectsStaleLeaderToken) {
+// After batch 1 has been durably written by leader-A (owner_token="leader-A"),
+// a new leader that took over after A's lease was lost must be able to
+// continue the batch_id sequence with a different owner_token. This is the
+// failover path: each etcd lease has a unique id, so a legitimate new leader
+// WILL carry a token the previous leader never used.
+//
+// Note: AppendBatch does not fence against a stale leader — that is enforced
+// at a higher layer (Stage 6 promotion gate / LogWriter session injection).
+// This test pins the contract that /latest_batch does not gate on
+// owner_token equality.
+TEST_F(EtcdOpLogStoreTest, Stage3_AppendBatchAcceptsNewLeaderAfterFailover) {
     ASSERT_EQ(ErrorCode::OK,
               store_->AppendBatch(MakeBatch(0, 1, "leader-A", 11)));
 
-    // Different owner_token at batch_id=2 must be rejected.
-    EXPECT_EQ(ErrorCode::STALE_LEADER,
-              store_->AppendBatch(MakeBatch(0, 2, "leader-B", 22)));
-
-    // Even an empty owner_token is treated as a different leader.
-    EXPECT_EQ(ErrorCode::STALE_LEADER,
-              store_->AppendBatch(MakeBatch(0, 2, "", 22)));
-
-    // Same owner_token succeeds and advances latest_batch to 2.
+    // A new leader with a different owner_token continues the batch_id
+    // sequence. The previous (broken) implementation would reject this as
+    // STALE_LEADER, which is what we are deliberately NOT doing anymore.
     ASSERT_EQ(ErrorCode::OK,
-              store_->AppendBatch(MakeBatch(0, 2, "leader-A", 11)));
+              store_->AppendBatch(MakeBatch(0, 2, "leader-B", 22)));
+    ASSERT_EQ(ErrorCode::OK,
+              store_->AppendBatch(MakeBatch(0, 3, "leader-B", 22)));
+
+    // latest_batch advanced monotonically across the failover boundary.
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, store_->GetLatestBatchId(0, latest));
-    EXPECT_EQ(2u, latest);
+    EXPECT_EQ(3u, latest);
+
+    // The durable records carry the owner_token of the leader that wrote
+    // them, regardless of whether a subsequent leader overrode the global
+    // pointer with a different token.
+    OpLogBatchRecord b1;
+    OpLogBatchRecord b2;
+    OpLogBatchRecord b3;
+    ASSERT_EQ(ErrorCode::OK, store_->ReadBatch(0, 1, b1));
+    ASSERT_EQ(ErrorCode::OK, store_->ReadBatch(0, 2, b2));
+    ASSERT_EQ(ErrorCode::OK, store_->ReadBatch(0, 3, b3));
+    EXPECT_EQ("leader-A", b1.owner_token);
+    EXPECT_EQ("leader-B", b2.owner_token);
+    EXPECT_EQ("leader-B", b3.owner_token);
+
+    // The previous leader cannot rewind the sequence by replaying an old
+    // batch_id. That is rejected on batch_id-continuity grounds — not on
+    // owner_token equality.
+    EXPECT_EQ(ErrorCode::SEQUENCE_CONFLICT,
+              store_->AppendBatch(MakeBatch(0, 2, "leader-A", 11)));
+
+    // The next slot (batch_id == latest + 1) is still open for whoever
+    // happens to be writing. Empty owner_token and "leader-A" both work —
+    // that is the whole point of NOT fencing at this layer.
+    ASSERT_EQ(ErrorCode::OK, store_->AppendBatch(MakeBatch(0, 4, "", 33)));
+    ASSERT_EQ(ErrorCode::OK, store_->GetLatestBatchId(0, latest));
+    EXPECT_EQ(4u, latest);
 }
 
 // LegacyGroupCommitDoesNotOverwriteDifferentExistingSequenceValue

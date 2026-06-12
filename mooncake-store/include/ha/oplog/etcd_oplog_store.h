@@ -140,14 +140,16 @@ class EtcdOpLogStore : public OpLogStore {
     // Implements the etcd half of the contract defined in plan §6:
     //   - key schema:  /oplog/{cluster}/shards/{shard}/batches/{batch_id:020d}
     //                  /oplog/{cluster}/shards/{shard}/latest_batch
-    //   - AppendBatch: enforces batch_id == latest_batch + 1, owner_token
-    //                  continuity against the durable history, idempotent
+    //   - AppendBatch: enforces batch_id == latest_batch + 1, idempotent
     //                  retry of the same payload, and rejection of
     //                  same-batch-id with a different payload.
-    //   - latest_batch value format: "<batch_id>|<owner_token>" (the
-    //                  '|' separator is safe because owner_token is the
-    //                  etcd lease id encoded as a decimal string by
-    //                  EtcdLeaderCoordinator::MakeOwnerToken).
+    //   - latest_batch value format: plain decimal "<batch_id>" string.
+    //
+    // Note: AppendBatch does NOT fence against a stale leader by inspecting
+    // the durable owner_token. A legitimate new leader (new lease_id after
+    // failover) must be able to continue the batch_id sequence regardless of
+    // the token the previous leader used. Real fencing is enforced at a
+    // higher layer (Stage 6 promotion gate / LogWriter session injection).
     // ------------------------------------------------------------------
 
     ErrorCode AppendBatch(const OpLogBatchRecord& batch) override;
@@ -195,19 +197,16 @@ class EtcdOpLogStore : public OpLogStore {
     std::string BuildLatestBatchKey(uint32_t shard_id) const;
 
     // Stage 3: encode / parse the latest_batch value of the form
-    // "<batch_id>|<owner_token>". Returns false on any malformation.
-    static std::string EncodeLatestBatchValue(uint64_t batch_id,
-                                              const std::string& owner_token);
+    // "<batch_id>". Returns false on any malformation.
+    static std::string EncodeLatestBatchValue(uint64_t batch_id);
     static bool ParseLatestBatchValue(const std::string& value,
-                                      uint64_t& batch_id,
-                                      std::string& owner_token);
+                                      uint64_t& batch_id);
 
     // Stage 3: read the latest_batch value (if any) for the given shard.
-    // Returns OK with batch_id=0 and owner_token empty when the shard has no
-    // batches yet; returns OPLOG_ENTRY_NOT_FOUND only for true backend
-    // failures that prevent the read.
-    ErrorCode ReadLatestBatchValue(uint32_t shard_id, uint64_t& batch_id,
-                                   std::string& owner_token);
+    // Returns OK with batch_id=0 when the shard has no batches yet; returns
+    // OPLOG_ENTRY_NOT_FOUND only for true backend failures that prevent the
+    // read.
+    ErrorCode ReadLatestBatchValue(uint32_t shard_id, uint64_t& batch_id);
 
     // Stage 3: read the durable batch record at (shard_id, batch_id) and
     // compare it byte-for-byte (after deserialization) against `expected`.
