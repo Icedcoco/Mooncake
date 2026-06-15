@@ -474,6 +474,7 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -515,6 +516,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 auto MasterService::MountNoFSegment(const NoFSegment& segment,
                                     const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
 #ifndef USE_NOF
     LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << segment.name
                << ", error=nof_pool_disabled";
@@ -541,6 +543,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
     if (ok_client_.contains(client_id)) {
@@ -587,6 +590,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                                       const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
 #ifndef USE_NOF
     LOG(ERROR) << "client_id=" << client_id
                << ", segments_count=" << segments.size()
@@ -907,6 +911,7 @@ void MasterService::TaskCleanupThreadFunc() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -943,6 +948,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -980,6 +986,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
 auto MasterService::UnmountNoFSegment(const UUID& segment_id,
                                       const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
 #ifndef USE_NOF
     LOG(ERROR) << "client_id=" << client_id << ", segment_id=" << segment_id
                << ", error=nof_pool_disabled";
@@ -1025,6 +1032,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 auto MasterService::ExistKey(const std::string& key,
                              const std::string& tenant_id)
     -> tl::expected<bool, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, MakeObjectIdentity(key, tenant_id));
     if (!accessor.Exists()) {
@@ -1276,6 +1284,7 @@ auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
     -> tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>
         results;
     results.reserve(client_ids.size());
@@ -1292,6 +1301,7 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
@@ -1397,6 +1407,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     -> tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
     std::regex pattern;
 
@@ -1444,6 +1455,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
 auto MasterService::GetReplicaList(const std::string& key,
                                    const std::string& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentity(key, tenant_id);
 
@@ -1789,6 +1801,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     const auto object_id = MakeObjectIdentity(key, tenant_id);
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -1912,6 +1925,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            const std::string& tenant_id,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentity(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -2029,6 +2043,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const std::string& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, MakeObjectIdentity(key, tenant_id));
     if (!accessor.Exists()) {
@@ -2080,6 +2095,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
@@ -2091,6 +2107,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
@@ -2119,6 +2136,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     const auto object_id = MakeObjectIdentity(key, tenant_id);
     // --- Parameter validation (same as PutStart) ---
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
@@ -2374,6 +2392,7 @@ auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const std::string& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return PutEnd(client_id, key, tenant_id, replica_type);
 }
 
@@ -2381,6 +2400,7 @@ auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
                                  const std::string& tenant_id,
                                  ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return PutRevoke(client_id, key, tenant_id, replica_type);
 }
 
@@ -2390,6 +2410,7 @@ MasterService::BatchUpsertStart(const UUID& client_id,
                                 const std::string& tenant_id,
                                 const std::vector<uint64_t>& slice_lengths,
                                 const ReplicateConfig& config) {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
@@ -2420,12 +2441,14 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return BatchPutEnd(client_id, keys, tenant_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return BatchPutRevoke(client_id, keys, tenant_id);
 }
 
@@ -2949,6 +2972,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
 auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentity(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -2989,6 +3013,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
 auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                                   const std::string& tenant_id, bool force)
     -> tl::expected<long, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     long removed_count = 0;
     std::regex pattern;
 
@@ -3147,6 +3172,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
 auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                                 const std::string& tenant_id, bool force)
     -> std::vector<tl::expected<void, ErrorCode>> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
 
@@ -3277,6 +3303,7 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     ClientStatus client_status;
     auto it = ok_client_.find(client_id);
@@ -3356,6 +3383,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();
@@ -3690,6 +3718,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
 
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
+    mooncake::MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();

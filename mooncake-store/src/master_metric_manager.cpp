@@ -62,6 +62,17 @@ MasterMetricManager::MasterMetricManager()
       active_clients_("master_active_clients",
                       "Total number of active clients"),
 
+      // Initialize RPC Health Metrics
+      rpc_thread_pool_size_(
+          "mooncake_master_rpc_thread_pool_size",
+          "Configured number of RPC server threads"),
+      rpc_in_flight_gauge_(
+          "mooncake_master_rpc_in_flight_requests",
+          "Number of RPC handlers currently executing"),
+      rpc_queue_depth_gauge_(
+          "mooncake_master_rpc_queue_depth",
+          "Approximate number of RPC requests waiting for a thread"),
+
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
                           "Total number of PutStart requests received"),
@@ -458,6 +469,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
+    rpc_thread_pool_size_.update(0);
+    rpc_in_flight_gauge_.update(0);
+    rpc_queue_depth_gauge_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -815,6 +829,43 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+// RPC Health Metrics
+void MasterMetricManager::observe_rpc_thread_pool_size(size_t value) {
+    rpc_thread_pool_size_value_.store(value);
+    rpc_thread_pool_size_.update(value);
+}
+
+void MasterMetricManager::inc_rpc_in_flight() {
+    size_t value = ++rpc_in_flight_value_;
+    rpc_in_flight_gauge_.update(value);
+    // Approximate queue depth as excess in-flight over thread pool size.
+    size_t pool_size = rpc_thread_pool_size_value_.load();
+    rpc_queue_depth_gauge_.update(value > pool_size ? value - pool_size : 0);
+}
+
+void MasterMetricManager::dec_rpc_in_flight() {
+    size_t old = rpc_in_flight_value_.fetch_sub(1, std::memory_order_acq_rel);
+    size_t value = (old > 0) ? (old - 1) : 0;
+    // If old was already 0, restore to 0 (we just went to size_t max).
+    if (old == 0) {
+        rpc_in_flight_value_.store(0, std::memory_order_release);
+    }
+    rpc_in_flight_gauge_.update(value);
+    size_t pool_size = rpc_thread_pool_size_value_.load();
+    rpc_queue_depth_gauge_.update(value > pool_size ? value - pool_size : 0);
+}
+
+void MasterMetricManager::observe_rpc_in_flight(size_t value) {
+    rpc_in_flight_value_.store(value);
+    rpc_in_flight_gauge_.update(value);
+    size_t pool_size = rpc_thread_pool_size_value_.load();
+    rpc_queue_depth_gauge_.update(value > pool_size ? value - pool_size : 0);
+}
+
+void MasterMetricManager::observe_rpc_queue_depth(size_t value) {
+    rpc_queue_depth_gauge_.update(value);
 }
 
 // Store-observed cache reuse metrics
@@ -1674,6 +1725,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
+    serialize_metric(rpc_thread_pool_size_);
+    serialize_metric(rpc_in_flight_gauge_);
+    serialize_metric(rpc_queue_depth_gauge_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);

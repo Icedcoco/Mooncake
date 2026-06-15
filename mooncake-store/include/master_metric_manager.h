@@ -125,6 +125,26 @@ class MasterMetricManager {
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
 
+    // RPC Health Metrics
+    void observe_rpc_thread_pool_size(size_t value);
+    void inc_rpc_in_flight();
+    void dec_rpc_in_flight();
+    void observe_rpc_in_flight(size_t value);
+    void observe_rpc_queue_depth(size_t value);
+
+    /**
+     * @brief RAII guard that increments master RPC in-flight gauge on
+     * construction and decrements it on destruction. Place at the top of each
+     * instrumented RPC handler body.
+     */
+    class RpcInFlightGuard {
+       public:
+        RpcInFlightGuard() { MasterMetricManager::instance().inc_rpc_in_flight(); }
+        ~RpcInFlightGuard() {
+            MasterMetricManager::instance().dec_rpc_in_flight();
+        }
+    };
+
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);
     void inc_snapshot_success();
@@ -538,6 +558,13 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+
+    // RPC Health Metrics
+    ylt::metric::gauge_t rpc_thread_pool_size_;
+    ylt::metric::gauge_t rpc_in_flight_gauge_;
+    ylt::metric::gauge_t rpc_queue_depth_gauge_;
+    std::atomic<size_t> rpc_thread_pool_size_value_{0};
+    std::atomic<size_t> rpc_in_flight_value_{0};
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

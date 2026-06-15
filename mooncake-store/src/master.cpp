@@ -20,6 +20,7 @@
 #include "utils.h"
 
 #include "master_config.h"
+#include "master_metric_manager.h"
 #include "version.h"
 
 using namespace coro_rpc;
@@ -1118,6 +1119,8 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
+        mooncake::MasterMetricManager::instance().observe_rpc_thread_pool_size(
+            master_config.rpc_thread_num);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
