@@ -20,6 +20,7 @@ WrappedMasterService::~WrappedMasterService() = default;
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
@@ -34,6 +35,7 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
 
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchExistKey");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -69,6 +71,7 @@ tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>
 WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchQueryIp");
     const size_t total_client_ids = client_ids.size();
     timer.LogRequest("client_ids_count=", total_client_ids);
@@ -109,6 +112,7 @@ tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchReplicaClear");
     const size_t total_keys = object_keys.size();
     timer.LogRequest("object_keys_count=", total_keys,
@@ -178,6 +182,7 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -278,6 +283,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<uint64_t>& slice_lengths,
                                     const ReplicateConfig& config,
                                     const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -370,6 +376,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -410,6 +417,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -505,6 +513,7 @@ WrappedMasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
     const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchUpsertStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -540,6 +549,7 @@ WrappedMasterService::BatchUpsertStart(
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -575,6 +585,7 @@ std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
                                         const std::vector<std::string>& keys,
                                         const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchUpsertRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -640,6 +651,7 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchRemove");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys, ", force=", force);
@@ -918,6 +930,7 @@ std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "BatchEvictDiskReplica");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys,
@@ -1017,6 +1030,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "GetFsdir");
     timer.LogRequest("action=get_fsdir");
 
@@ -1028,6 +1042,7 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
 
 tl::expected<GetStorageConfigResponse, ErrorCode>
 WrappedMasterService::GetStorageConfig() {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "GetStorageConfig");
     timer.LogRequest("action=get_storage_config");
 
@@ -1039,6 +1054,7 @@ WrappedMasterService::GetStorageConfig() {
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 

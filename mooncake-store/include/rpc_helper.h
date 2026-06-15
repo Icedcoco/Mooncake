@@ -7,6 +7,7 @@
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "master_metric_manager.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 
@@ -24,6 +25,13 @@ concept TlExpected = is_tl_expected<std::decay_t<T>>::value;
 /**
  * @brief A helper function to execute a single RPC call, handling common tasks
  * like logging, metrics, and error handling.
+ *
+ * The in-flight RPC gauge is incremented for the duration of the call so that
+ * the master's `mooncake_master_rpc_in_flight_requests` Prometheus metric
+ * reflects the number of *external* RPC requests being served, not the number
+ * of internal business-method invocations. Tracking at this layer (the RPC
+ * wrapper boundary) means a single external RPC contributes +1, even if the
+ * handler internally calls other business methods.
  *
  * @tparam RpcCallable A callable object that executes the RPC and returns a
  * tl::expected.
@@ -43,6 +51,11 @@ auto execute_rpc(std::string_view rpc_name, RpcCallable&& rpc_call,
                  IncReqMetric&& inc_req_metric, IncFailMetric&& inc_fail_metric)
     requires TlExpected<std::invoke_result_t<RpcCallable>>
 {
+    // One guard covers all paths through the wrapper: success, error
+    // return, and exception. The guard's destructor runs on scope exit
+    // (including stack unwinding) so the gauge is always balanced.
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
+
     ScopedVLogTimer timer(1, rpc_name.data());
     log_request(timer);
 
