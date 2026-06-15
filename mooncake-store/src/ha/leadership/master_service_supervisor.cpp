@@ -14,6 +14,7 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/standby_controller.h"
 #include "master_admin_service.h"
+#include "master_metric_manager.h"
 #include "rpc_service.h"
 
 namespace mooncake {
@@ -345,6 +346,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         coro_rpc::coro_rpc_server server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
+        // Expose the configured RPC thread pool size to the metric manager
+        // so that mooncake_master_rpc_thread_pool_size is correct in the
+        // HA path as well. The non-HA path in master.cpp does the same
+        // call right after constructing the coro_rpc_server; without it,
+        // HA deployments would always show thread_pool_size = 0.
+        MasterMetricManager::instance().observe_rpc_thread_pool_size(
+            config.rpc_thread_num);
         const char* protocol = std::getenv("MC_RPC_PROTOCOL");
         if (protocol && std::string_view(protocol) == "rdma") {
             server.init_ibv();
