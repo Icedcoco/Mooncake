@@ -130,7 +130,17 @@ class MasterMetricManager {
     void inc_rpc_in_flight();
     void dec_rpc_in_flight();
     void observe_rpc_in_flight(size_t value);
-    void observe_rpc_queue_depth(size_t value);
+
+    // Test-only read accessors for the RPC health atomic counters. They are
+    // not part of the public metrics contract; they exist so unit tests can
+    // assert on the actual in-process value rather than parsing the
+    // serialized Prometheus output.
+    size_t test_get_rpc_thread_pool_size() const {
+        return rpc_thread_pool_size_value_.load();
+    }
+    size_t test_get_rpc_in_flight() const {
+        return rpc_in_flight_value_.load();
+    }
 
     /**
      * @brief RAII guard that increments master RPC in-flight gauge on
@@ -562,7 +572,6 @@ class MasterMetricManager {
     // RPC Health Metrics
     ylt::metric::gauge_t rpc_thread_pool_size_;
     ylt::metric::gauge_t rpc_in_flight_gauge_;
-    ylt::metric::gauge_t rpc_queue_depth_gauge_;
     std::atomic<size_t> rpc_thread_pool_size_value_{0};
     std::atomic<size_t> rpc_in_flight_value_{0};
 

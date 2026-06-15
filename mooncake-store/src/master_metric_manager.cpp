@@ -69,9 +69,6 @@ MasterMetricManager::MasterMetricManager()
       rpc_in_flight_gauge_(
           "mooncake_master_rpc_in_flight_requests",
           "Number of RPC handlers currently executing"),
-      rpc_queue_depth_gauge_(
-          "mooncake_master_rpc_queue_depth",
-          "Approximate number of RPC requests waiting for a thread"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
@@ -471,7 +468,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_in_flight_metric_.update(0);
     rpc_thread_pool_size_.update(0);
     rpc_in_flight_gauge_.update(0);
-    rpc_queue_depth_gauge_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -840,9 +836,6 @@ void MasterMetricManager::observe_rpc_thread_pool_size(size_t value) {
 void MasterMetricManager::inc_rpc_in_flight() {
     size_t value = ++rpc_in_flight_value_;
     rpc_in_flight_gauge_.update(value);
-    // Approximate queue depth as excess in-flight over thread pool size.
-    size_t pool_size = rpc_thread_pool_size_value_.load();
-    rpc_queue_depth_gauge_.update(value > pool_size ? value - pool_size : 0);
 }
 
 void MasterMetricManager::dec_rpc_in_flight() {
@@ -853,19 +846,11 @@ void MasterMetricManager::dec_rpc_in_flight() {
         rpc_in_flight_value_.store(0, std::memory_order_release);
     }
     rpc_in_flight_gauge_.update(value);
-    size_t pool_size = rpc_thread_pool_size_value_.load();
-    rpc_queue_depth_gauge_.update(value > pool_size ? value - pool_size : 0);
 }
 
 void MasterMetricManager::observe_rpc_in_flight(size_t value) {
     rpc_in_flight_value_.store(value);
     rpc_in_flight_gauge_.update(value);
-    size_t pool_size = rpc_thread_pool_size_value_.load();
-    rpc_queue_depth_gauge_.update(value > pool_size ? value - pool_size : 0);
-}
-
-void MasterMetricManager::observe_rpc_queue_depth(size_t value) {
-    rpc_queue_depth_gauge_.update(value);
 }
 
 // Store-observed cache reuse metrics
@@ -1727,7 +1712,6 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(active_clients_);
     serialize_metric(rpc_thread_pool_size_);
     serialize_metric(rpc_in_flight_gauge_);
-    serialize_metric(rpc_queue_depth_gauge_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
