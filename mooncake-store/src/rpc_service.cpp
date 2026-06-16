@@ -640,6 +640,7 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
 }
 
 long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
@@ -1067,6 +1068,7 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return GetMooncakeStoreVersion();
 }
 
@@ -1094,6 +1096,7 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
     LOG(INFO) << "Mount local disk segment with client id is : " << client_id
@@ -1108,6 +1111,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
     timer.LogRequest("action=offload_object_heartbeat");
     auto result =
@@ -1117,6 +1121,7 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
 
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     const UUID& client_id, int64_t ssd_total_capacity_bytes) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
     timer.LogRequest("client_id=", client_id,
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
@@ -1127,6 +1132,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
     timer.LogRequest("action=notify_offload_success");
 
@@ -1138,6 +1144,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
 
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
     timer.LogRequest("action=promotion_object_heartbeat");
     return master_service_.PromotionObjectHeartbeat(client_id);
@@ -1147,6 +1154,7 @@ tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "PromotionAllocStart");
     timer.LogRequest("action=promotion_alloc_start");
     auto result = master_service_.PromotionAllocStart(client_id, key, tenant_id,
@@ -1158,6 +1166,7 @@ WrappedMasterService::PromotionAllocStart(
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
     timer.LogRequest("action=notify_promotion_success");
     auto result =
@@ -1169,6 +1178,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     ScopedVLogTimer timer(1, "NotifyPromotionFailure");
     timer.LogRequest("action=notify_promotion_failure");
     auto result =
@@ -1179,26 +1189,31 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return master_service_.CreateDrainJob(request);
 }
 
 tl::expected<QueryJobResponse, ErrorCode> WrappedMasterService::QueryDrainJob(
     const UUID& job_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return master_service_.QueryDrainJob(job_id);
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::CancelDrainJob(
     const UUID& job_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return master_service_.CancelDrainJob(job_id);
 }
 
 tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
     const std::string& segment_name) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return master_service_.QuerySegmentStatus(segment_name);
 }
 
 tl::expected<SegmentStatus, ErrorCode>
 WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
+    MasterMetricManager::RpcInFlightGuard rpc_in_flight_guard;
     return master_service_.QuerySegmentStatusById(segment_id);
 }
 
