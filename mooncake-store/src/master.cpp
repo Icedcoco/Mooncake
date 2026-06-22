@@ -148,6 +148,38 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+
+// HA capability gate (Stage 1). These flags expose the four capabilities
+// the supervisor validates against the configured backend. Defaults
+// preserve the legacy single-entry oplog path so that nothing changes
+// for operators who don't opt in. `full` is only reachable when the
+// backend is etcd AND `ha_oplog_format=batched` AND
+// `ha_oplog_shard_count=1` AND `ha_put_end_commit_mode=async`.
+DEFINE_string(ha_required_level, "degraded",
+              "HA capability gate: disabled | degraded | full. Defaults to "
+              "degraded so existing single-master deployments are unaffected");
+DEFINE_string(ha_oplog_format, "legacy_sequence",
+              "Durable OpLog format: legacy_sequence | batched. batched is "
+              "only supported when ha_required_level=full and the backend "
+              "is etcd");
+DEFINE_uint32(ha_oplog_shard_count, 1,
+              "Number of OpLog shards (only shard 0 is supported today)");
+DEFINE_string(ha_put_end_commit_mode, "async",
+              "PUT_END commit mode: async | strict. Only async is supported "
+              "in basic-available HA");
+
+// Stage 4: LogWriter batching tunables. Only consulted when
+// ha_oplog_format=batched AND ha_required_level=full. Defaults match
+// plan §7.2: small batches, short max-delay, sync op always flushes.
+DEFINE_uint32(ha_oplog_batch_max_entries, 64,
+              "Max entries per LogWriter batch before forcing a flush");
+DEFINE_uint64(ha_oplog_batch_max_bytes, 1 * 1024 * 1024,
+              "Max bytes per LogWriter batch before forcing a flush");
+DEFINE_uint64(ha_oplog_batch_max_delay_us, 1000,
+              "Max delay (microseconds) before flushing a non-full batch");
+DEFINE_bool(ha_oplog_flush_on_sync_op, true,
+            "If true, enqueuing a sync op (REMOVE/segment lifecycle) "
+            "immediately triggers a flush of the in-progress batch");
 DEFINE_int64(
     client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
     "Seconds a client stays considered alive after the last heartbeat. "
@@ -382,6 +414,29 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_ha_backend_connstring);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
+    default_config.GetString("ha_required_level",
+                             &master_config.ha_required_level,
+                             FLAGS_ha_required_level);
+    default_config.GetString("ha_oplog_format", &master_config.ha_oplog_format,
+                             FLAGS_ha_oplog_format);
+    default_config.GetUInt32("ha_oplog_shard_count",
+                             &master_config.ha_oplog_shard_count,
+                             FLAGS_ha_oplog_shard_count);
+    default_config.GetString("ha_put_end_commit_mode",
+                             &master_config.ha_put_end_commit_mode,
+                             FLAGS_ha_put_end_commit_mode);
+    default_config.GetUInt32("ha_oplog_batch_max_entries",
+                             &master_config.ha_oplog_batch_max_entries,
+                             FLAGS_ha_oplog_batch_max_entries);
+    default_config.GetUInt64("ha_oplog_batch_max_bytes",
+                             &master_config.ha_oplog_batch_max_bytes,
+                             FLAGS_ha_oplog_batch_max_bytes);
+    default_config.GetUInt64("ha_oplog_batch_max_delay_us",
+                             &master_config.ha_oplog_batch_max_delay_us,
+                             FLAGS_ha_oplog_batch_max_delay_us);
+    default_config.GetBool("ha_oplog_flush_on_sync_op",
+                           &master_config.ha_oplog_flush_on_sync_op,
+                           FLAGS_ha_oplog_flush_on_sync_op);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
     default_config.GetString("oplog_store_type",
@@ -697,6 +752,49 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_required_level", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_required_level = FLAGS_ha_required_level;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_oplog_format", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_oplog_format = FLAGS_ha_oplog_format;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_oplog_shard_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_oplog_shard_count = FLAGS_ha_oplog_shard_count;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_put_end_commit_mode", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_put_end_commit_mode = FLAGS_ha_put_end_commit_mode;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_oplog_batch_max_entries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_oplog_batch_max_entries =
+            FLAGS_ha_oplog_batch_max_entries;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_oplog_batch_max_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_oplog_batch_max_bytes = FLAGS_ha_oplog_batch_max_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_oplog_batch_max_delay_us", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_oplog_batch_max_delay_us =
+            FLAGS_ha_oplog_batch_max_delay_us;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_oplog_flush_on_sync_op", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_oplog_flush_on_sync_op =
+            FLAGS_ha_oplog_flush_on_sync_op;
     }
     if ((google::GetCommandLineFlagInfo("client_ttl", &info) &&
          !info.is_default) ||
@@ -1045,6 +1143,18 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
+        << ", ha_required_level=" << master_config.ha_required_level
+        << ", ha_oplog_format=" << master_config.ha_oplog_format
+        << ", ha_oplog_shard_count=" << master_config.ha_oplog_shard_count
+        << ", ha_put_end_commit_mode=" << master_config.ha_put_end_commit_mode
+        << ", ha_oplog_batch_max_entries="
+        << master_config.ha_oplog_batch_max_entries
+        << ", ha_oplog_batch_max_bytes="
+        << master_config.ha_oplog_batch_max_bytes
+        << ", ha_oplog_batch_max_delay_us="
+        << master_config.ha_oplog_batch_max_delay_us
+        << ", ha_oplog_flush_on_sync_op="
+        << master_config.ha_oplog_flush_on_sync_op
         << ", client_ttl=" << master_config.client_live_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port

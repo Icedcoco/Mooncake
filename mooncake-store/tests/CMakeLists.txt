@@ -177,6 +177,7 @@ add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
+add_ha_test(oplog_log_writer_test ha/oplog/oplog_log_writer_test.cpp)
 add_ha_test(oplog_manager_test ha/oplog/oplog_manager_test.cpp)
 add_ha_test(etcd_oplog_store_test ha/oplog/etcd_oplog_store_test.cpp)
 add_ha_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)

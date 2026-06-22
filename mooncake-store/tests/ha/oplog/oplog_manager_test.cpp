@@ -4,12 +4,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "ha/oplog/oplog_log_writer.h"
 #include "mock_oplog_store.h"
 
 namespace mooncake::test {
@@ -366,8 +370,60 @@ TEST_F(OpLogManagerTest, RetryPreservesSequenceId) {
 // ===========================================================================
 TEST(OpLogStoreBaseBatchApiTest,
      BaseOpLogStoreBatchMethodsReturnUnavailableByDefault) {
-    MockOpLogStore mock;
-    OpLogStore& base = mock;  // exercise the base-class virtuals.
+    // We need a concrete OpLogStore that does NOT override the batch
+    // methods so the base-class virtuals run. MockOpLogStore overrides
+    // all of them (so LogWriter unit tests can exercise real sequence
+    // and inject failures), so we use a local empty subclass here.
+    struct BareOpLogStore : public OpLogStore {
+        ErrorCode Init() override { return ErrorCode::OK; }
+        ErrorCode WriteOpLog(const OpLogEntry& e, bool s) override {
+            (void)e;
+            (void)s;
+            return ErrorCode::OK;
+        }
+        ErrorCode ReadOpLog(uint64_t s, OpLogEntry& e) override {
+            (void)s;
+            (void)e;
+            return ErrorCode::OK;
+        }
+        ErrorCode ReadOpLogSince(uint64_t s, size_t l,
+                                 std::vector<OpLogEntry>& v) override {
+            (void)s;
+            (void)l;
+            (void)v;
+            return ErrorCode::OK;
+        }
+        ErrorCode GetLatestSequenceId(uint64_t& s) override {
+            s = 0;
+            return ErrorCode::OK;
+        }
+        ErrorCode GetMaxSequenceId(uint64_t& s) override {
+            s = 0;
+            return ErrorCode::OK;
+        }
+        ErrorCode UpdateLatestSequenceId(uint64_t s) override {
+            (void)s;
+            return ErrorCode::OK;
+        }
+        ErrorCode RecordSnapshotSequenceId(const std::string& s,
+                                           uint64_t v) override {
+            (void)s;
+            (void)v;
+            return ErrorCode::OK;
+        }
+        ErrorCode GetSnapshotSequenceId(const std::string& s,
+                                        uint64_t& v) override {
+            (void)s;
+            v = 0;
+            return ErrorCode::OK;
+        }
+        ErrorCode CleanupOpLogBefore(uint64_t s) override {
+            (void)s;
+            return ErrorCode::OK;
+        }
+    };
+    BareOpLogStore bare;
+    OpLogStore& base = bare;
 
     OpLogBatchRecord append_batch;
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
@@ -386,6 +442,87 @@ TEST(OpLogStoreBaseBatchApiTest,
     uint64_t latest_batch = 99;
     EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
               base.GetLatestBatchId(/*shard_id=*/0, latest_batch));
+}
+
+// ===========================================================================
+// Stage 4 batched-mode tests (plan §7.3 RED tests 5, 6).
+//
+// These tests verify that OpLogManager routes Append/AppendAndPersist
+// through a configured LogWriter when batched mode is active. PUT_END is
+// async (returns immediately); REMOVE is sync (blocks for batch durable).
+// Both must surface backend errors when the batch fails.
+// ===========================================================================
+
+namespace {
+OpLogLogWriterConfig MakeStage4TestConfig(uint32_t max_entries = 64,
+                                          int delay_ms = 0) {
+    (void)delay_ms;  // for documentation; mock delay set separately
+    OpLogLogWriterConfig cfg;
+    cfg.shard_id = 0;
+    cfg.max_entries = max_entries;
+    cfg.max_bytes = 1u << 20;
+    cfg.max_delay = std::chrono::microseconds(50000);
+    cfg.flush_on_sync_op = true;
+    cfg.producer_view_version = 1;
+    cfg.owner_token = "stage4-test-token";
+    return cfg;
+}
+}  // namespace
+
+// RED 5: PUT_END returns BEFORE its containing batch becomes durable.
+// We assert that Enqueue returns synchronously (the future is NOT ready
+// when we check immediately after) and that the assigned position is in
+// the batched space (shard_id=0, batch_id >= 1).
+TEST_F(OpLogManagerTest, OpLogManagerBatchedModePutEndReturnsBeforeDurable) {
+    MockOpLogStore store;
+    store.SetBatchDurabilityDelayMs(500);  // backend takes 500ms
+    auto writer = std::make_shared<OpLogLogWriter>(
+        MakeStage4TestConfig(/*max_entries=*/64),
+        std::shared_ptr<OpLogStore>(&store, [](auto*) {}));
+    ASSERT_EQ(ErrorCode::OK, writer->Start());
+    manager_->SetLogWriter(writer);
+    ASSERT_TRUE(manager_->IsBatchedMode());
+
+    auto t0 = std::chrono::steady_clock::now();
+    EnqueueResult r =
+        manager_->AppendBatched(OpType::PUT_END, "default", "key1", "v1");
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+        100);
+    EXPECT_EQ(0u, r.position.shard_id);
+    EXPECT_GE(r.position.batch_id, 1u);
+    EXPECT_EQ(0u, r.position.local_index);
+    // Future should NOT be ready yet (backend takes 500ms).
+    auto status = r.durable_result.wait_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(std::future_status::timeout, status);
+    // Drive the batch to completion so the writer doesn't leak.
+    writer->TriggerFlush();
+    EXPECT_EQ(ErrorCode::OK, r.durable_result.get());
+    writer->Shutdown();
+}
+
+// RED 6: REMOVE returns ErrorCode error when AppendBatch fails. The
+// manager must propagate the backend failure so MasterService can abort
+// the dirty mutation rather than reporting success and corrupting
+// standby view.
+TEST_F(OpLogManagerTest,
+       OpLogManagerBatchedModeRemoveReturnsErrorWhenAppendBatchFails) {
+    MockOpLogStore store;
+    store.SetBatchWriteError(ErrorCode::ETCD_OPERATION_ERROR);
+    auto writer = std::make_shared<OpLogLogWriter>(
+        MakeStage4TestConfig(/*max_entries=*/4),
+        std::shared_ptr<OpLogStore>(&store, [](auto*) {}));
+    ASSERT_EQ(ErrorCode::OK, writer->Start());
+    manager_->SetLogWriter(writer);
+    ASSERT_TRUE(manager_->IsBatchedMode());
+
+    auto result =
+        manager_->AppendAndPersist(OpType::REMOVE, "default", "key1", "");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
+    EXPECT_EQ(0u, store.BatchAppendCount());
+    writer->Shutdown();
 }
 
 }  // namespace mooncake::test

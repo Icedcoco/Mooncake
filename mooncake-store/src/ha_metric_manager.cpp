@@ -65,6 +65,24 @@ HAMetricManager::HAMetricManager()
           "ha_oplog_sync_batch_commits_total",
           "Total number of sync batches (triggered by DELETE/Sync ops)"),
 
+      // Stage 4: LogWriter batching metrics. The "pending" gauges track
+      // current queue size; counters track lifetime throughput and
+      // failures. See plan §7.4.
+      oplog_batch_writer_pending_entries_(
+          "ha_oplog_batch_writer_pending_entries",
+          "Stage 4 LogWriter: number of enqueued entries awaiting flush"),
+      oplog_batch_writer_pending_bytes_(
+          "ha_oplog_batch_writer_pending_bytes",
+          "Stage 4 LogWriter: total bytes of enqueued entries awaiting "
+          "flush"),
+      oplog_batch_writer_durable_batches_total_(
+          "ha_oplog_batch_writer_durable_batches_total",
+          "Stage 4 LogWriter: number of batches successfully committed "
+          "via AppendBatch"),
+      oplog_batch_writer_flush_failures_total_(
+          "ha_oplog_batch_writer_flush_failures_total",
+          "Stage 4 LogWriter: number of AppendBatch failures"),
+
       // Latency Histograms (buckets in microseconds)
       // 100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s
       oplog_etcd_write_latency_us_(
@@ -76,6 +94,11 @@ HAMetricManager::HAMetricManager()
           "ha_oplog_apply_latency_us",
           "Latency of OpLog entry application in microseconds",
           {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}),
+      oplog_batch_writer_flush_latency_us_(
+          "ha_oplog_batch_writer_flush_latency_us",
+          "Stage 4 LogWriter: latency of AppendBatch calls in microseconds",
+          {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000,
+           5000000}),
 
       // State Machine
       standby_state_(
@@ -225,6 +248,49 @@ int64_t HAMetricManager::get_oplog_batch_commits_total() {
 
 int64_t HAMetricManager::get_oplog_sync_batch_commits_total() {
     return static_cast<int64_t>(oplog_sync_batch_commits_total_.value());
+}
+
+// =====================================================================
+// Stage 4: LogWriter batching metric methods (plan §7.4)
+// =====================================================================
+
+void HAMetricManager::set_oplog_batch_writer_pending_entries(int64_t val) {
+    oplog_batch_writer_pending_entries_.update(val);
+}
+
+int64_t HAMetricManager::get_oplog_batch_writer_pending_entries() {
+    return static_cast<int64_t>(oplog_batch_writer_pending_entries_.value());
+}
+
+void HAMetricManager::set_oplog_batch_writer_pending_bytes(int64_t val) {
+    oplog_batch_writer_pending_bytes_.update(val);
+}
+
+int64_t HAMetricManager::get_oplog_batch_writer_pending_bytes() {
+    return static_cast<int64_t>(oplog_batch_writer_pending_bytes_.value());
+}
+
+void HAMetricManager::inc_oplog_batch_writer_durable_batches(int64_t val) {
+    oplog_batch_writer_durable_batches_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_batch_writer_durable_batches_total() {
+    return static_cast<int64_t>(
+        oplog_batch_writer_durable_batches_total_.value());
+}
+
+void HAMetricManager::inc_oplog_batch_writer_flush_failures(int64_t val) {
+    oplog_batch_writer_flush_failures_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_batch_writer_flush_failures_total() {
+    return static_cast<int64_t>(
+        oplog_batch_writer_flush_failures_total_.value());
+}
+
+void HAMetricManager::observe_oplog_batch_writer_flush_latency_us(
+    int64_t latency_us) {
+    oplog_batch_writer_flush_latency_us_.observe(latency_us);
 }
 
 // ========== Latency Histograms ==========

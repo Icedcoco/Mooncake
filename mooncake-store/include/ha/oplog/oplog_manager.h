@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -17,6 +18,7 @@ namespace mooncake {
 
 // Forward declaration
 class OpLogStore;
+class OpLogLogWriter;
 
 // Operation types for hot-standby replication.
 // This is a minimal subset that can be extended later.
@@ -125,6 +127,30 @@ struct OpLogBatchRecord {
     uint32_t batch_checksum{0};
 };
 
+// Stage 4: per-entry durability mode for batched writes. See plan §7.2.
+enum class OpLogDurabilityMode {
+    // Return EnqueueResult immediately. durable_result resolves when the
+    // containing batch is durable (or has failed). PUT_END uses this.
+    kAsync,
+    // Block until the containing batch is durable (or has failed). REMOVE
+    // and segment lifecycle ops use this so the caller knows the mutation
+    // is durable before freeing/reusing memory.
+    kWaitBatchDurable,
+};
+
+// Stage 4: result of a batched enqueue.
+//   - position: the durable (shard_id, batch_id, local_index) triple this
+//     entry will occupy once its containing batch is durable. Position is
+//     assigned synchronously so callers can use it for tracing or
+//     continuation without waiting for the future.
+//   - durable_result: resolves to OK when the batch is durable, or to the
+//     backend error code when the batch fails. For kWaitBatchDurable, the
+//     future is already satisfied by the time Enqueue returns.
+struct EnqueueResult {
+    OpLogBatchPosition position;
+    std::shared_future<ErrorCode> durable_result;
+};
+
 /**
  * @brief In-memory operation log manager.
  *
@@ -140,6 +166,30 @@ class OpLogManager {
     // Set the OpLogStore for writing OpLog to persistent storage (optional).
     // If not set, OpLog will only be stored in memory buffer.
     void SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store);
+
+    // Stage 4: install a LogWriter and switch the manager to batched write
+    // mode. When a LogWriter is set, Append() routes PUT_END through the
+    // writer (kAsync), and AppendAndPersist() routes all dirty mutations
+    // through the writer (kWaitBatchDurable). The legacy WriteOpLog path
+    // is bypassed entirely while batched mode is active. The writer must
+    // outlive the manager; setting a nullptr reverts to legacy mode.
+    void SetLogWriter(std::shared_ptr<OpLogLogWriter> log_writer);
+
+    // Stage 4: returns true when a LogWriter is currently driving writes.
+    bool IsBatchedMode() const;
+
+    // Stage 4: batched-mode Append. Behaves as the legacy Append() but
+    // routes through the LogWriter: PUT_END is enqueued with
+    // kAsync (returns immediately, durable_result resolves later); other
+    // op types are enqueued with kWaitBatchDurable (blocks until the
+    // containing batch is durable or fails). The returned EnqueueResult
+    // carries the durable (shard, batch_id, local_index) and the
+    // durable_result future. Tests use this API to verify batched
+    // behavior directly. Requires IsBatchedMode() == true; returns an
+    // EnqueueResult with INTERNAL_ERROR future otherwise.
+    EnqueueResult AppendBatched(OpType type, const std::string& tenant_id,
+                                const std::string& key,
+                                const std::string& payload);
 
     // Append a new entry and return the assigned sequence_id.
     // This is a best-effort (async) path: the entry is buffered in memory
@@ -237,6 +287,11 @@ class OpLogManager {
 
     // Optional OpLog store for persistent storage
     std::shared_ptr<OpLogStore> oplog_store_;
+
+    // Stage 4: optional LogWriter that drives the batched write pipeline.
+    // When non-null, Append/AppendAndPersist route through it instead of
+    // oplog_store_->WriteOpLog.
+    std::shared_ptr<OpLogLogWriter> log_writer_;
 
     // Simple bounds to avoid unbounded memory growth.
     static constexpr size_t kMaxBufferEntries_ = 100000;

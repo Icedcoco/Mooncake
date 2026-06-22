@@ -141,6 +141,41 @@ class HAMetricManager {
     void inc_oplog_sync_batch_commits(int64_t count = 1);
     int64_t get_oplog_sync_batch_commits_total();
 
+    // ========== Stage 4: LogWriter batching metrics ==========
+
+    /**
+     * @brief Set current number of pending entries in the LogWriter
+     *        (gauges — plan §7.4). Increases on Enqueue, decreases on
+     *        flush completion.
+     */
+    void set_oplog_batch_writer_pending_entries(int64_t val);
+    int64_t get_oplog_batch_writer_pending_entries();
+
+    /**
+     * @brief Set current number of pending bytes in the LogWriter queue.
+     */
+    void set_oplog_batch_writer_pending_bytes(int64_t val);
+    int64_t get_oplog_batch_writer_pending_bytes();
+
+    /**
+     * @brief Increment durable batch counter (one per AppendBatch OK).
+     */
+    void inc_oplog_batch_writer_durable_batches(int64_t val = 1);
+    int64_t get_oplog_batch_writer_durable_batches_total();
+
+    /**
+     * @brief Increment batched flush failure counter (one per AppendBatch
+     *        error). Drives alerting on Stage 4 batch pipeline health.
+     */
+    void inc_oplog_batch_writer_flush_failures(int64_t val = 1);
+    int64_t get_oplog_batch_writer_flush_failures_total();
+
+    /**
+     * @brief Observe batch flush latency (microseconds) — time from flush
+     *        trigger to AppendBatch return.
+     */
+    void observe_oplog_batch_writer_flush_latency_us(int64_t latency_us);
+
     // ========== Latency Histograms ==========
 
     /**
@@ -209,10 +244,17 @@ class HAMetricManager {
     ylt::metric::counter_t oplog_batch_commits_total_;
     ylt::metric::counter_t oplog_sync_batch_commits_total_;
 
+    // Stage 4: LogWriter batching metrics (plan §7.4).
+    ylt::metric::gauge_t oplog_batch_writer_pending_entries_;
+    ylt::metric::gauge_t oplog_batch_writer_pending_bytes_;
+    ylt::metric::counter_t oplog_batch_writer_durable_batches_total_;
+    ylt::metric::counter_t oplog_batch_writer_flush_failures_total_;
+
     // Latency Histograms (buckets in microseconds: 100us, 500us, 1ms, 5ms,
     // 10ms, 50ms, 100ms, 500ms, 1s)
     ylt::metric::histogram_t oplog_etcd_write_latency_us_;
     ylt::metric::histogram_t oplog_apply_latency_us_;
+    ylt::metric::histogram_t oplog_batch_writer_flush_latency_us_;
 
     // State Machine
     ylt::metric::gauge_t standby_state_;

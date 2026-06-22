@@ -60,6 +60,14 @@ struct MasterConfig {
     uint32_t ha_oplog_shard_count = 1;
     std::string ha_put_end_commit_mode = "async";
 
+    // Stage 4: LogWriter batching tunables. Only consulted when
+    // ha_oplog_format=batched AND ha_required_level=full. Defaults match
+    // plan §7.2 (small batches, short max-delay, sync op always flushes).
+    uint32_t ha_oplog_batch_max_entries = 64;
+    uint64_t ha_oplog_batch_max_bytes = 1 * 1024 * 1024;
+    uint64_t ha_oplog_batch_max_delay_us = 1000;
+    bool ha_oplog_flush_on_sync_op = true;
+
     // OpLog store configuration
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
@@ -169,6 +177,11 @@ class MasterServiceSupervisorConfig {
     std::string ha_oplog_format = "legacy_sequence";
     uint32_t ha_oplog_shard_count = 1;
     std::string ha_put_end_commit_mode = "async";
+    // Stage 4: LogWriter batching tunables (see MasterConfig for semantics).
+    uint32_t ha_oplog_batch_max_entries = 64;
+    uint64_t ha_oplog_batch_max_bytes = 1 * 1024 * 1024;
+    uint64_t ha_oplog_batch_max_delay_us = 1000;
+    bool ha_oplog_flush_on_sync_op = true;
     // OpLog store configuration
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
@@ -255,6 +268,10 @@ class MasterServiceSupervisorConfig {
         ha_oplog_format = config.ha_oplog_format;
         ha_oplog_shard_count = config.ha_oplog_shard_count;
         ha_put_end_commit_mode = config.ha_put_end_commit_mode;
+        ha_oplog_batch_max_entries = config.ha_oplog_batch_max_entries;
+        ha_oplog_batch_max_bytes = config.ha_oplog_batch_max_bytes;
+        ha_oplog_batch_max_delay_us = config.ha_oplog_batch_max_delay_us;
+        ha_oplog_flush_on_sync_op = config.ha_oplog_flush_on_sync_op;
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;

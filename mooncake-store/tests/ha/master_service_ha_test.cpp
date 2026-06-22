@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "ha/oplog/mock_oplog_store.h"
+#include "ha/oplog/oplog_log_writer.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -844,6 +845,78 @@ TEST_F(MasterServiceHATest,
 // proper test would need an integration harness that exercises the
 // retry queue across primary/standby boundaries (covered by
 // localfs_hot_standby_integration_test).
+
+// =====================================================================
+// Stage 4 batched-mode MasterService test (plan §7.3 RED test 7).
+//
+// Mirrors BatchRemovePersistFailureSkipsErase above but drives the
+// write path through the LogWriter (batched mode) instead of the
+// legacy WriteOpLog path. Verifies that when the containing batch is
+// refused by the backend, REMOVE dirty mutations do NOT erase the
+// local metadata (the durability-before-success invariant).
+// =====================================================================
+TEST_F(
+    MasterServiceHATest,
+    Stage4MasterServiceRemoveDoesNotEraseLocalMetadataWhenDirtyPersistFails) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("stage4_test_cluster")
+                              .build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+
+    auto mock_store = std::make_shared<MockOpLogStore>();
+    mock_store->SetBatchWriteError(ErrorCode::ETCD_OPERATION_ERROR);
+    service->SetOpLogStoreForTesting(mock_store);
+
+    // Build a LogWriter that points at the same mock store. The mock
+    // already has a batch error installed, so AppendBatch will refuse.
+    OpLogLogWriterConfig writer_cfg;
+    writer_cfg.shard_id = 0;
+    writer_cfg.max_entries = 4;
+    writer_cfg.max_bytes = 1u << 20;
+    writer_cfg.max_delay = std::chrono::microseconds(50000);
+    writer_cfg.flush_on_sync_op = true;
+    writer_cfg.producer_view_version = 1;
+    writer_cfg.owner_token = "stage4-test-token";
+    auto writer = std::make_shared<OpLogLogWriter>(
+        writer_cfg, std::shared_ptr<OpLogStore>(mock_store));
+    ASSERT_EQ(ErrorCode::OK, writer->Start());
+    service->SetLogWriterForTesting(writer);
+
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    // Disable the etcd-write retry loop so the test fails fast on the
+    // first AppendBatch error instead of retrying with exponential
+    // backoff for tens of seconds.
+    service->SetOpLogRetryConfigForTesting(/*max_attempts=*/1,
+                                           /*max_backoff_ms=*/0);
+    const UUID client_id = generate_uuid();
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 3; ++i) {
+        keys.push_back("stage4_key_" + std::to_string(i));
+        PutObject(*service, client_id, keys.back());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    auto results = service->BatchRemove(keys, /*force=*/true);
+    ASSERT_EQ(keys.size(), results.size());
+    // Every remove must report failure because the batch was refused.
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_FALSE(results[i].has_value())
+            << "Expected failure for key=" << keys[i]
+            << " — durability-before-success violated";
+    }
+    // And, crucially, the keys must STILL be in metadata.
+    for (const auto& key : keys) {
+        auto exist = service->ExistKey(key);
+        ASSERT_TRUE(exist.has_value());
+        EXPECT_TRUE(exist.value())
+            << "Key should still exist after dirty persist failed: " << key;
+    }
+
+    writer->Shutdown();
+}
 
 }  // namespace mooncake::test
 

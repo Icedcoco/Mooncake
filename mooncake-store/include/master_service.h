@@ -33,6 +33,7 @@
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
+#include "ha/oplog/oplog_log_writer.h"
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_store.h"
 #include "ha/oplog/oplog_store_factory.h"
@@ -96,6 +97,14 @@ class MasterService {
      *        any HA OpLog operations.
      */
     void SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
+
+    /**
+     * @brief Stage 4: install a LogWriter and activate batched write
+     *        mode. Used by tests to drive MasterService through the
+     *        batched durable path. The store and writer must outlive the
+     *        service.
+     */
+    void SetLogWriterForTesting(std::shared_ptr<OpLogLogWriter> log_writer);
 
     /**
      * @brief Override retry behavior for OpLog persist in tests.

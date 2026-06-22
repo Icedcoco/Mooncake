@@ -5,6 +5,7 @@
 #include <xxhash.h>
 #include <glog/logging.h>
 
+#include "ha/oplog/oplog_log_writer.h"
 #include "ha/oplog/oplog_store.h"
 
 namespace mooncake {
@@ -16,6 +17,59 @@ void OpLogManager::SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store) {
     oplog_store_ = oplog_store;
 }
 
+void OpLogManager::SetLogWriter(std::shared_ptr<OpLogLogWriter> log_writer) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    log_writer_ = std::move(log_writer);
+}
+
+bool OpLogManager::IsBatchedMode() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return log_writer_ != nullptr;
+}
+
+EnqueueResult OpLogManager::AppendBatched(OpType type,
+                                          const std::string& tenant_id,
+                                          const std::string& key,
+                                          const std::string& payload) {
+    OpLogEntry entry;
+    entry.op_type = type;
+    entry.tenant_id = tenant_id;
+    entry.object_key = key;
+    entry.payload = payload;
+    entry.timestamp_ms = NowMs();
+    entry.checksum = ComputeChecksum(entry.payload);
+    entry.prefix_hash = ComputePrefixHash(entry.object_key);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        entry.sequence_id = ++last_seq_id_;
+        if (buffer_.size() >= kMaxBufferEntries_) {
+            buffer_.pop_front();
+            ++first_seq_id_;
+        }
+        buffer_.emplace_back(entry);
+    }
+
+    std::shared_ptr<OpLogLogWriter> writer;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        writer = log_writer_;
+    }
+    if (!writer) {
+        auto promise = std::make_shared<std::promise<ErrorCode>>();
+        promise->set_value(ErrorCode::INTERNAL_ERROR);
+        EnqueueResult bad;
+        bad.position = {0, 0, 0};
+        bad.durable_result = promise->get_future();
+        return bad;
+    }
+
+    const OpLogDurabilityMode mode =
+        (type == OpType::PUT_END) ? OpLogDurabilityMode::kAsync
+                                  : OpLogDurabilityMode::kWaitBatchDurable;
+    return writer->Enqueue(entry, mode);
+}
+
 uint64_t OpLogManager::Append(OpType type, const std::string& key,
                               const std::string& payload) {
     return Append(type, "default", key, payload);
@@ -24,6 +78,16 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
 uint64_t OpLogManager::Append(OpType type, const std::string& tenant_id,
                               const std::string& key,
                               const std::string& payload) {
+    // Stage 4: batched mode routes through the LogWriter. PUT_END is
+    // async (returns immediately), other ops block until containing batch
+    // is durable.
+    if (IsBatchedMode()) {
+        EnqueueResult r = AppendBatched(type, tenant_id, key, payload);
+        // We don't propagate durable_result here — callers that need
+        // error propagation for dirty ops use AppendAndPersist instead.
+        return r.position.batch_id;  // best-effort monotonic id from batch
+    }
+
     OpLogEntry entry;
     entry.op_type = type;
     entry.tenant_id = tenant_id;
@@ -98,9 +162,25 @@ OpLogEntry OpLogManager::AllocateEntry(OpType type,
 }
 
 ErrorCode OpLogManager::PersistEntry(const OpLogEntry& entry) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock1(mutex_);
+    auto writer = log_writer_;
     auto store = oplog_store_;
-    lock.unlock();
+    lock1.unlock();
+    // Stage 4: in batched mode the durable path goes through the writer.
+    // PUT_END is async (returns immediately); other ops wait for the
+    // containing batch to be durable (or to fail).
+    if (writer) {
+        const OpLogDurabilityMode mode =
+            (entry.op_type == OpType::PUT_END)
+                ? OpLogDurabilityMode::kAsync
+                : OpLogDurabilityMode::kWaitBatchDurable;
+        EnqueueResult r = writer->Enqueue(entry, mode);
+        if (mode == OpLogDurabilityMode::kAsync) {
+            return ErrorCode::OK;
+        }
+        return r.durable_result.get();
+    }
+
     if (!store) {
         return ErrorCode::INTERNAL_ERROR;
     }
@@ -117,6 +197,19 @@ tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
 tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
     OpType type, const std::string& tenant_id, const std::string& key,
     const std::string& payload) {
+    // Stage 4: in batched mode route the dirty mutation through the
+    // LogWriter and wait for the containing batch to be durable. This is
+    // what guarantees dirty-mutation durable-before-success under
+    // ha_oplog_format=batched.
+    if (IsBatchedMode()) {
+        EnqueueResult r = AppendBatched(type, tenant_id, key, payload);
+        ErrorCode err = r.durable_result.get();
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        return r.position.batch_id;
+    }
+
     // Seq pre-allocation semantics: allocate first, then persist.
     OpLogEntry entry = AllocateEntry(type, tenant_id, key, payload);
     ErrorCode err = PersistEntry(entry);

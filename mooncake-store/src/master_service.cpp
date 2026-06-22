@@ -460,6 +460,11 @@ void MasterService::SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store) {
     oplog_manager_.SetOpLogStore(oplog_store_);
 }
 
+void MasterService::SetLogWriterForTesting(
+    std::shared_ptr<OpLogLogWriter> log_writer) {
+    oplog_manager_.SetLogWriter(std::move(log_writer));
+}
+
 void MasterService::SetOpLogRetryConfigForTesting(uint32_t max_attempts,
                                                   uint32_t max_backoff_ms) {
     oplog_retry_max_attempts_for_testing_.store(max_attempts,
@@ -8324,6 +8329,18 @@ ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
         LOG(ERROR) << "OpLogStore not available, cannot persist entry seq="
                    << entry.sequence_id;
         return ErrorCode::INTERNAL_ERROR;
+    }
+    // Stage 4: in batched mode the dirty-mutation must surface the
+    // backend error on the FIRST attempt. Retrying would re-enqueue a
+    // new entry with a new sequence_id, advance batch_id, and (worse)
+    // mask the failure from the caller — violating durable-before-
+    // success. Legacy mode keeps the exponential-backoff retry loop.
+    if (oplog_manager_.IsBatchedMode()) {
+        ErrorCode err = oplog_manager_.PersistEntry(entry);
+        if (err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_oplog_etcd_write_failures();
+        }
+        return err;
     }
     const uint32_t max_attempts =
         oplog_retry_max_attempts_for_testing_.load(std::memory_order_relaxed);
