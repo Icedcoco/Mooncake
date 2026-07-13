@@ -269,6 +269,8 @@ DEFINE_int32(oplog_poll_interval_ms, 1000,
 DEFINE_uint32(oplog_batch_max_entries, 1024,
               "Maximum number of committed/reserved entries in the open "
               "batch-record OpLog waiting batch.");
+DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
+              "Maximum time to retry transient batch OpLog standby errors.");
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
@@ -514,6 +516,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("oplog_batch_max_entries",
                              &master_config.oplog_batch_max_entries,
                              FLAGS_oplog_batch_max_entries);
+    default_config.GetUInt32("batch_oplog_retry_timeout_sec",
+                             &master_config.batch_oplog_retry_timeout_sec,
+                             FLAGS_batch_oplog_retry_timeout_sec);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",
@@ -880,6 +885,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.oplog_batch_max_entries = FLAGS_oplog_batch_max_entries;
+    }
+    if ((google::GetCommandLineFlagInfo("batch_oplog_retry_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.batch_oplog_retry_timeout_sec =
+            FLAGS_batch_oplog_retry_timeout_sec;
     }
     if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
          !info.is_default) ||
