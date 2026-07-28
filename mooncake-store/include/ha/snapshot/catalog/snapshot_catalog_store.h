@@ -110,31 +110,67 @@ inline bool ParseDecimal(std::string_view text, Integer& value) {
     return result.ec == std::errc() && result.ptr == end;
 }
 
+inline bool ValidateSnapshotDescriptor(const SnapshotDescriptor& descriptor) {
+    if (descriptor.schema_version == 0) {
+        return descriptor.last_included_batch_id == 0 &&
+               descriptor.payload_checksum.empty() &&
+               descriptor.previous_snapshot_id.empty();
+    }
+    return descriptor.schema_version == kSnapshotDescriptorSchemaVersion &&
+           (descriptor.last_included_seq == 0) ==
+               (descriptor.last_included_batch_id == 0) &&
+           !descriptor.payload_checksum.empty() &&
+           descriptor.payload_checksum.find('|') == std::string::npos &&
+           (descriptor.previous_snapshot_id.empty() ||
+            IsValidSnapshotId(descriptor.previous_snapshot_id));
+}
+
 inline std::string SerializeSnapshotDescriptor(
     const SnapshotDescriptor& descriptor) {
-    return std::to_string(descriptor.last_included_seq) + "|" +
-           std::to_string(descriptor.producer_view_version) + "|" +
-           std::to_string(descriptor.created_at_ms);
+    std::string payload = std::to_string(descriptor.last_included_seq) + "|" +
+                          std::to_string(descriptor.producer_view_version) +
+                          "|" + std::to_string(descriptor.created_at_ms);
+    if (descriptor.schema_version == 0) {
+        return payload;
+    }
+    return payload + "|" + std::to_string(descriptor.schema_version) + "|" +
+           std::to_string(descriptor.last_included_batch_id) + "|" +
+           descriptor.payload_checksum + "|" + descriptor.previous_snapshot_id;
 }
 
 inline tl::expected<SnapshotDescriptor, ErrorCode>
 DeserializeSnapshotDescriptor(const std::string& snapshot_root,
                               const SnapshotId& snapshot_id,
                               std::string_view payload) {
-    const auto first = payload.find('|');
-    const auto second = first == std::string_view::npos
-                            ? std::string_view::npos
-                            : payload.find('|', first + 1);
-    if (first == std::string_view::npos || second == std::string_view::npos) {
+    std::vector<std::string_view> fields;
+    for (size_t begin = 0;;) {
+        const size_t end = payload.find('|', begin);
+        fields.emplace_back(payload.substr(begin, end - begin));
+        if (end == std::string_view::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (fields.size() != 3 && fields.size() != 7) {
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
 
     SnapshotDescriptor descriptor =
         MakeSnapshotDescriptor(snapshot_root, snapshot_id);
-    if (!ParseDecimal(payload.substr(0, first), descriptor.last_included_seq) ||
-        !ParseDecimal(payload.substr(first + 1, second - first - 1),
-                      descriptor.producer_view_version) ||
-        !ParseDecimal(payload.substr(second + 1), descriptor.created_at_ms)) {
+    if (!ParseDecimal(fields[0], descriptor.last_included_seq) ||
+        !ParseDecimal(fields[1], descriptor.producer_view_version) ||
+        !ParseDecimal(fields[2], descriptor.created_at_ms)) {
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    if (fields.size() == 7) {
+        if (!ParseDecimal(fields[3], descriptor.schema_version) ||
+            !ParseDecimal(fields[4], descriptor.last_included_batch_id)) {
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        descriptor.payload_checksum = fields[5];
+        descriptor.previous_snapshot_id = fields[6];
+    }
+    if (!ValidateSnapshotDescriptor(descriptor)) {
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
     return descriptor;

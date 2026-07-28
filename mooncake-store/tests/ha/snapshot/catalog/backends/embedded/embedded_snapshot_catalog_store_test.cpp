@@ -103,6 +103,16 @@ class EmbeddedSnapshotCatalogStoreTest : public ::testing::Test {
         return descriptor;
     }
 
+    static ha::SnapshotDescriptor MakeVersionedDescriptor(
+        const std::string& snapshot_id) {
+        auto descriptor = MakeDescriptor(snapshot_id);
+        descriptor.last_included_batch_id = 9;
+        descriptor.payload_checksum = "xxh64:0123456789abcdef";
+        descriptor.schema_version = ha::kSnapshotDescriptorSchemaVersion;
+        descriptor.previous_snapshot_id = "20240229_120000_001";
+        return descriptor;
+    }
+
     void PutObject(const std::string& key, const std::string& value) {
         auto result = backend_.UploadString(key, value);
         ASSERT_TRUE(result.has_value()) << result.error();
@@ -127,6 +137,118 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest, PublishAndGetLatestRoundTrip) {
     EXPECT_EQ(latest->value().last_included_seq, 42u);
     EXPECT_EQ(latest->value().producer_view_version, 7u);
     EXPECT_EQ(latest->value().created_at_ms, 1700000000000);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       PublishAndGetLatestRoundTripsVersionedDescriptor) {
+    ASSERT_EQ(store_.Publish(MakeVersionedDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+
+    auto latest = store_.GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+    EXPECT_EQ(latest->value().last_included_seq, 42u);
+    EXPECT_EQ(latest->value().last_included_batch_id, 9u);
+    EXPECT_EQ(latest->value().payload_checksum, "xxh64:0123456789abcdef");
+    EXPECT_EQ(latest->value().schema_version,
+              ha::kSnapshotDescriptorSchemaVersion);
+    EXPECT_EQ(latest->value().previous_snapshot_id, "20240229_120000_001");
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       SerializeDescriptorPreservesLegacyAndAppendsVersionedFields) {
+    EXPECT_EQ(ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
+                  MakeDescriptor("20240301_120000_001")),
+              "42|7|1700000000000");
+    EXPECT_EQ(ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
+                  MakeVersionedDescriptor("20240301_120000_001")),
+              "42|7|1700000000000|1|9|xxh64:0123456789abcdef|"
+              "20240229_120000_001");
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       DeserializeLegacyDescriptorDefaultsVersionedFields) {
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
+            store_.GetSnapshotRoot(), "20240301_120000_001",
+            "42|7|1700000000000");
+
+    ASSERT_TRUE(descriptor.has_value());
+    EXPECT_EQ(descriptor->last_included_seq, 42u);
+    EXPECT_EQ(descriptor->producer_view_version, 7u);
+    EXPECT_EQ(descriptor->created_at_ms, 1700000000000);
+    EXPECT_EQ(descriptor->last_included_batch_id, 0u);
+    EXPECT_TRUE(descriptor->payload_checksum.empty());
+    EXPECT_EQ(descriptor->schema_version, 0u);
+    EXPECT_TRUE(descriptor->previous_snapshot_id.empty());
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       PublishRejectsUnsupportedDescriptorSchema) {
+    auto descriptor = MakeVersionedDescriptor("20240301_120000_001");
+    descriptor.schema_version = ha::kSnapshotDescriptorSchemaVersion + 1;
+
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       PublishRejectsIncompleteVersionedCursor) {
+    auto descriptor = MakeVersionedDescriptor("20240301_120000_001");
+    descriptor.last_included_batch_id = 0;
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::INVALID_PARAMS);
+
+    descriptor.last_included_seq = 0;
+    descriptor.last_included_batch_id = 9;
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest, PublishAcceptsEmptyVersionedCursor) {
+    auto descriptor = MakeVersionedDescriptor("20240301_120000_001");
+    descriptor.last_included_seq = 0;
+    descriptor.last_included_batch_id = 0;
+
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::OK);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       PublishRejectsEmptyOrDelimitedPayloadChecksum) {
+    auto descriptor = MakeVersionedDescriptor("20240301_120000_001");
+    descriptor.payload_checksum.clear();
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::INVALID_PARAMS);
+
+    descriptor.payload_checksum = "xxh64|0123456789abcdef";
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       PublishRejectsInvalidPreviousSnapshotId) {
+    auto descriptor = MakeVersionedDescriptor("20240301_120000_001");
+    descriptor.previous_snapshot_id = "invalid-id";
+
+    EXPECT_EQ(store_.Publish(descriptor), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       DeserializeRejectsMalformedVersionedDescriptors) {
+    const std::vector<std::string_view> invalid_payloads = {
+        "42|7|1700000000000|2|9|xxh64:0123456789abcdef|",
+        "42|7|1700000000000|1|0|xxh64:0123456789abcdef|",
+        "42|7|1700000000000|1|9||",
+        "42|7|1700000000000|1|9|xxh64:0123456789abcdef|invalid-id",
+        "42|7|1700000000000|1|9|checksum",
+        "42|7|1700000000000|1|9|checksum||extra",
+    };
+
+    for (const auto payload : invalid_payloads) {
+        auto descriptor =
+            ha::snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
+                store_.GetSnapshotRoot(), "20240301_120000_001", payload);
+        if (descriptor.has_value()) {
+            ADD_FAILURE() << payload;
+            continue;
+        }
+        EXPECT_EQ(descriptor.error(), ErrorCode::DESERIALIZE_FAIL) << payload;
+    }
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest,

@@ -154,6 +154,7 @@ ErrorCode RedisSnapshotCatalogStore::Publish(
     const SnapshotDescriptor& snapshot) {
     if (!snapshot_catalog_store_detail::IsValidSnapshotId(
             snapshot.snapshot_id) ||
+        !snapshot_catalog_store_detail::ValidateSnapshotDescriptor(snapshot) ||
         connstring_.empty() || object_store_ == nullptr) {
         return ErrorCode::INVALID_PARAMS;
     }

@@ -85,7 +85,11 @@ ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_root,
     descriptor.manifest_key = snapshot_root + snapshot_id + "/manifest.txt";
     descriptor.object_prefix = snapshot_root + snapshot_id + "/";
     descriptor.last_included_seq = 42;
+    descriptor.last_included_batch_id = 9;
     descriptor.producer_view_version = 7;
+    descriptor.payload_checksum = "xxh64:0123456789abcdef";
+    descriptor.schema_version = ha::kSnapshotDescriptorSchemaVersion;
+    descriptor.previous_snapshot_id = "20240229_120000_001";
     descriptor.created_at_ms = 1700000000000;
     return descriptor;
 }
@@ -153,7 +157,12 @@ TEST_F(RedisSnapshotCatalogStoreTest, PublishListAndGetLatestRoundTrip) {
     EXPECT_EQ(latest->value().manifest_key,
               store_->GetSnapshotRoot() + "20240302_120000_001/manifest.txt");
     EXPECT_EQ(latest->value().last_included_seq, 42u);
+    EXPECT_EQ(latest->value().last_included_batch_id, 9u);
     EXPECT_EQ(latest->value().producer_view_version, 7u);
+    EXPECT_EQ(latest->value().payload_checksum, "xxh64:0123456789abcdef");
+    EXPECT_EQ(latest->value().schema_version,
+              ha::kSnapshotDescriptorSchemaVersion);
+    EXPECT_EQ(latest->value().previous_snapshot_id, "20240229_120000_001");
     EXPECT_EQ(latest->value().created_at_ms, 1700000000000);
 
     auto snapshots = store_->List(0);

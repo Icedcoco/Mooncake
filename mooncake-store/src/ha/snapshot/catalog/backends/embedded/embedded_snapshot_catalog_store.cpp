@@ -54,7 +54,8 @@ ErrorCode EmbeddedSnapshotCatalogStore::Publish(
         return err;
     }
     if (!snapshot_catalog_store_detail::IsValidSnapshotId(
-            snapshot.snapshot_id)) {
+            snapshot.snapshot_id) ||
+        !snapshot_catalog_store_detail::ValidateSnapshotDescriptor(snapshot)) {
         return ErrorCode::INVALID_PARAMS;
     }
 
