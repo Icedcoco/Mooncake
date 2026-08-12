@@ -33,7 +33,7 @@ env:
 # Gate the dependency root so all downstream jobs are skipped in forks.
 jobs:
   version-stamp:
-    if: github.repository == 'kvcache-ai/Mooncake'
+    if: github.repository == 'kvcache-ai/Mooncake' || github.ref_name == 'Icedcoco/verify-nightly-port-fix'
     runs-on: ubuntu-22.04
     outputs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
@@ -54,6 +54,7 @@ jobs:
           echo "Nightly version: $NIGHTLY_VERSION"
 
   build-wheels:
+    if: false
     needs: version-stamp
     strategy:
       fail-fast: false
@@ -83,6 +84,7 @@ jobs:
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-musa:
+    if: false
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
     steps:
@@ -113,6 +115,7 @@ jobs:
         shell: bash
 
   build-docker:
+    if: false
     name: Build Docker Image
     runs-on: ubuntu-22.04
     steps:
@@ -135,12 +138,13 @@ jobs:
             -t mooncake:from-source .
 
   ascend-test:
+    if: false
     uses: ./.github/workflows/ci_ascend.yml
     secrets: inherit
 
   publish-testpypi:
+    if: false
     needs: [version-stamp, build-wheels, nightly-test]
-    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
     permissions:
@@ -330,6 +334,7 @@ jobs:
           bash scripts/run_tests.sh
 
   nightly-coverage:
+    if: false
     runs-on: ubuntu-22.04
     env:
       CI: "true"
@@ -468,8 +473,7 @@ jobs:
           fi
 
   nightly-gate:
-    # always() bypasses skipped dependencies, so this job needs its own guard.
-    if: ${{ always() && github.repository == 'kvcache-ai/Mooncake' }}
+    if: false
     needs:
       - version-stamp
       - build-wheels
