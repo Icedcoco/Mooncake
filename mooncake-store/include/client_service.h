@@ -244,6 +244,11 @@ class Client {
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchPutMetadataOnly(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<uint64_t>>& slice_lengths,
+        const ReplicateConfig& config);
+
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
      */

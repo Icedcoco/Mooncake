@@ -3617,8 +3617,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
+    const auto setup_started_at = std::chrono::steady_clock::now();
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_setup_latency_us.observe(
+            elapsed_us_since(setup_started_at));
+    }
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             return std::vector<tl::expected<void, ErrorCode>>(
@@ -3629,11 +3634,26 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return BatchWriteWhenPreferSameNode(ops, false);
     }
     StartBatchPut(ops, client_cfg);
+    const auto staging_started_at = std::chrono::steady_clock::now();
     StageWriteBuffersForRemoteReplicas(ops, stager);
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_buffer_staging_latency_us.observe(
+            elapsed_us_since(staging_started_at));
+    }
 
     auto t0 = std::chrono::steady_clock::now();
+    auto submit_started_at = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_submit_latency_us.observe(
+            elapsed_us_since(submit_started_at));
+    }
+    auto wait_started_at = std::chrono::steady_clock::now();
     WaitForTransfers(ops);
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_wait_latency_us.observe(
+            elapsed_us_since(wait_started_at));
+    }
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -3642,8 +3662,52 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
 
+    const auto finalize_started_at = std::chrono::steady_clock::now();
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto results = CollectResults(ops);
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_finalize_latency_us.observe(
+            elapsed_us_since(finalize_started_at));
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutMetadataOnly(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config) {
+    if (keys.size() != slice_lengths.size() || keys.empty()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto starts = master_client_.BatchPutStart(keys, slice_lengths, config);
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    if (starts.size() != keys.size()) return results;
+    std::vector<ObjectMeta> metas;
+    std::vector<std::string> revoke_keys;
+    metas.reserve(keys.size());
+    revoke_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!starts[i]) {
+            results[i] = tl::unexpected(starts[i].error());
+            revoke_keys.push_back(keys[i]);
+            continue;
+        }
+        metas.emplace_back(ObjectMeta{keys[i], std::nullopt});
+    }
+    if (!metas.empty()) {
+        auto ends = master_client_.BatchPutEnd(metas, ReplicaType::MEMORY);
+        size_t end_index = 0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (!starts[i]) continue;
+            results[i] = ends[end_index++];
+        }
+    }
+    if (!revoke_keys.empty()) {
+        (void)master_client_.BatchPutRevoke(revoke_keys, ReplicaType::ALL);
+    }
+    return results;
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>

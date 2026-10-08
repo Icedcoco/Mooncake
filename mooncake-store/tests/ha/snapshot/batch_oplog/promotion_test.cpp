@@ -216,4 +216,24 @@ TEST(BatchOpLogPromotionTest, EmptyStoreRestoresWithoutChunks) {
                     .has_value());
 }
 
+TEST(BatchOpLogPromotionTest,
+     RestoresBatchSnapshotMetadataWithManagedAttributes) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto metadata = std::make_unique<StandbyMetadataStore>();
+    StandbyObjectMetadata object;
+    object.client_id = {4, 9};
+    object.size = 8192;
+    object.group_id = "managed-group";
+    object.data_type = ObjectDataType::WEIGHT;
+    object.hard_pinned = true;
+    ASSERT_TRUE(metadata->PutMetadata("tenant", "managed-weight", object));
+
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(metadata);
+    handoff.applied_cursor = {.batch_id = 1, .last_seq = 1};
+    EXPECT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+}
+
 }  // namespace mooncake::test
