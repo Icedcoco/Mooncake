@@ -98,6 +98,26 @@ struct TransferMetric {
           batch_put_latency_us("mooncake_transfer_batch_put_latency",
                                "Batch Put transfer latency (us)",
                                kLatencyBucket, labels),
+          batch_put_setup_latency_us(
+              "mooncake_transfer_batch_put_setup_latency",
+              "Batch Put operation creation and checksum latency (us)",
+              kLatencyBucket, labels),
+          batch_put_buffer_staging_latency_us(
+              "mooncake_transfer_batch_put_buffer_staging_latency",
+              "Batch Put write-buffer staging latency (us)", kLatencyBucket,
+              labels),
+          batch_put_submit_latency_us(
+              "mooncake_transfer_batch_put_submit_latency",
+              "Batch Put transfer task submission latency (us)", kLatencyBucket,
+              labels),
+          batch_put_wait_latency_us(
+              "mooncake_transfer_batch_put_wait_latency",
+              "Batch Put transfer completion wait latency (us)", kLatencyBucket,
+              labels),
+          batch_put_finalize_latency_us(
+              "mooncake_transfer_batch_put_finalize_latency",
+              "Batch Put finalize and result collection latency (us)",
+              kLatencyBucket, labels),
           batch_get_latency_us("mooncake_transfer_batch_get_latency",
                                "Batch Get transfer latency (us)",
                                kLatencyBucket, labels),
@@ -110,6 +130,11 @@ struct TransferMetric {
     ylt::metric::counter_t total_read_bytes;
     ylt::metric::counter_t total_write_bytes;
     ylt::metric::histogram_t batch_put_latency_us;
+    ylt::metric::histogram_t batch_put_setup_latency_us;
+    ylt::metric::histogram_t batch_put_buffer_staging_latency_us;
+    ylt::metric::histogram_t batch_put_submit_latency_us;
+    ylt::metric::histogram_t batch_put_wait_latency_us;
+    ylt::metric::histogram_t batch_put_finalize_latency_us;
     ylt::metric::histogram_t batch_get_latency_us;
     ylt::metric::histogram_t get_latency_us;
     ylt::metric::histogram_t put_latency_us;
@@ -118,6 +143,11 @@ struct TransferMetric {
         total_read_bytes.serialize(str);
         total_write_bytes.serialize(str);
         batch_put_latency_us.serialize(str);
+        batch_put_setup_latency_us.serialize(str);
+        batch_put_buffer_staging_latency_us.serialize(str);
+        batch_put_submit_latency_us.serialize(str);
+        batch_put_wait_latency_us.serialize(str);
+        batch_put_finalize_latency_us.serialize(str);
         batch_get_latency_us.serialize(str);
         get_latency_us.serialize(str);
         put_latency_us.serialize(str);
@@ -149,6 +179,17 @@ struct TransferMetric {
            << "\n";
         ss << "Batch Put: " << format_latency_summary(batch_put_latency_us)
            << "\n";
+        ss << "Batch Put Setup: "
+           << format_latency_summary(batch_put_setup_latency_us) << "\n";
+        ss << "Batch Put Buffer Staging: "
+           << format_latency_summary(batch_put_buffer_staging_latency_us)
+           << "\n";
+        ss << "Batch Put Submit Transfers: "
+           << format_latency_summary(batch_put_submit_latency_us) << "\n";
+        ss << "Batch Put Wait Transfers: "
+           << format_latency_summary(batch_put_wait_latency_us) << "\n";
+        ss << "Batch Put Finalize: "
+           << format_latency_summary(batch_put_finalize_latency_us) << "\n";
 
         return ss.str();
     }
@@ -187,23 +228,22 @@ struct TransferMetric {
         std::stringstream ss;
         ss << "count=" << total_count;
 
-        // Find P95
-        int64_t p95_target = (total_count * 95) / 100;
-        int64_t cumulative = 0;
-        double p95_bucket = 0;
-
-        for (size_t i = 0; i < sum_ptr.size() && i < kLatencyBucket.size();
-             i++) {
-            cumulative += sum_ptr[i]->value();
-            if (cumulative >= p95_target && p95_bucket == 0) {
-                p95_bucket = kLatencyBucket[i];
-                break;
+        auto percentile_bucket = [&](int percentile) {
+            const int64_t target = (total_count * percentile + 99) / 100;
+            int64_t cumulative = 0;
+            for (size_t i = 0; i < sum_ptr.size() && i < kLatencyBucket.size();
+                 ++i) {
+                cumulative += sum_ptr[i]->value();
+                if (cumulative >= target) return kLatencyBucket[i];
             }
-        }
-
-        if (p95_bucket > 0) {
-            ss << ", p95<" << p95_bucket << "μs";
-        }
+            return 0.0;
+        };
+        const double p50 = percentile_bucket(50);
+        const double p95 = percentile_bucket(95);
+        const double p99 = percentile_bucket(99);
+        if (p50 > 0) ss << ", p50<" << p50 << "μs";
+        if (p95 > 0) ss << ", p95<" << p95 << "μs";
+        if (p99 > 0) ss << ", p99<" << p99 << "μs";
 
         // Find max bucket (highest bucket with data)
         double max_bucket = 0;
