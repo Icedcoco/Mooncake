@@ -142,12 +142,17 @@ TEST(MockClientConfigTest, RejectsDuplicateSegmentName) {
 TEST(MockClientConfigTest, CommandLineOverrideReplacesJsonSelection) {
     TemporaryConfigFile file(ValidConfig());
     auto result = MockClientConfig::LoadFile(
-        file.path().string(), std::string_view("remove:single=3"));
+        file.path().string(), std::string_view("put:batch=3,remove:single=1"));
 
     ASSERT_TRUE(result.has_value()) << result.error().message;
-    ASSERT_EQ(result->operations.size(), 1);
-    EXPECT_EQ(result->operations.front().operation, LogicalOperation::Remove);
+    ASSERT_EQ(result->operations.size(), 2);
+    EXPECT_EQ(result->operations.front().operation, LogicalOperation::Put);
+    EXPECT_EQ(result->operations.front().form, OperationForm::Batch);
     EXPECT_EQ(result->operations.front().weight, 3);
+    EXPECT_EQ(result->operations.front().batch_size.min, 1);
+    EXPECT_EQ(result->operations.front().batch_size.max, 8);
+    EXPECT_EQ(result->operations.back().operation, LogicalOperation::Remove);
+    EXPECT_EQ(result->operations.back().weight, 1);
 }
 
 TEST(MockClientConfigTest, RejectsEmptyJsonOperationSelection) {

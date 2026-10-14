@@ -264,6 +264,11 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
             if (!override_operations) {
                 return tl::make_unexpected(override_operations.error());
             }
+            for (auto& operation : *override_operations) {
+                if (operation.form == OperationForm::Batch) {
+                    operation.batch_size = config.batch_size;
+                }
+            }
             config.operations = std::move(*override_operations);
         }
 
