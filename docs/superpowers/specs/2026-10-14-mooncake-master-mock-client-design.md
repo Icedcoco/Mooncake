@@ -165,10 +165,39 @@ The JSON schema starts at version 1 and contains:
 - `replication`: memory/NoF/DFS replica counts, pin policy, preferred segment
   policy, and logical object size distribution;
 - `workload`: `low`, `medium`, `full`, or `adaptive`, target logical ops/s,
-  concurrency, batch limits, operation mix, and validation sampling;
+  concurrency, batch limits, operation selection/mix, and validation sampling;
 - `faults`: deterministic schedules for delays, response drops, disconnects,
   remounts, and injected error responses;
 - `report`: JSONL path, raw metrics path, scrape interval, and exit policy.
+
+The workload must explicitly select which logical operations are enabled. The
+selection is configuration-driven and may also be overridden by a command-line
+profile name for repeatable runs. Each entry has an operation name, an optional
+weight, a single-object or batch form, and batch size bounds. Supported logical
+operation names are `put`, `upsert`, `get`, and `remove`; `put` and `upsert`
+may use either their single RPC or batch RPC form, while `get` and `remove`
+may likewise select single or batch form. Session traffic (`ping`, mount,
+remount, and unmount) is always controlled separately and is not part of the
+logical operation mix.
+
+For example, these are valid profiles:
+
+```json
+{"operations":[{"name":"put","form":"single","weight":1}]}
+{"operations":[{"name":"put","form":"batch","weight":1,
+  "batch_size":{"min":128,"max":128}}]}
+{"operations":[
+  {"name":"put","form":"single","weight":3},
+  {"name":"remove","form":"single","weight":1}]}
+```
+
+An empty operation list is invalid. Weights are normalized among enabled
+entries; a fixed sequence or deterministic seed may be used when exact replay
+is required. A batch entry consumes one scheduling decision but contributes
+one logical operation per item. The report preserves the selected operation
+set and effective weights, so a run using only Put, only BatchPut, or a Put /
+Remove mixture cannot be confused with a default mixed workload. Validation
+reads may be enabled independently and are labeled `purpose=validation`.
 
 The workload profiles have fixed semantics:
 
