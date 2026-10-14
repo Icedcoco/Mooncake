@@ -62,6 +62,10 @@ endif()
 # Add subdirectories
 add_subdirectory(src)
 
+if(BUILD_MOCK_CLIENT)
+    add_subdirectory(tools/mock_client)
+endif()
+
 if (STORE_USE_ETCD)
     add_subdirectory(tools)
 endif()
