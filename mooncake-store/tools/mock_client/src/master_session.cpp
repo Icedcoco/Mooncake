@@ -95,16 +95,22 @@ bool MasterSession::ConnectHealthy() {
     return false;
 }
 bool MasterSession::ConnectAndMount() {
+    // Outstanding acknowledged or ambiguous mounts must be explicitly cleaned
+    // up or reconciled before a new mount sequence can replace bookkeeping.
+    if (!mounted_.empty()) return false;
     if (!ConnectHealthy()) return false;
-    mounted_.clear();
     for (const auto& s : segments_) {
         auto result = api_.InvokeRpc("MountSegment", 1,
                                      [&] { return api_.MountSegment(s); });
         if (!result) {
             const auto error = result.error();
-            Unmount();
-            Disconnect();
-            last_error_ = error;
+            if (IsTransportError(error)) mounted_.push_back(s);
+            if (Unmount()) {
+                Disconnect();
+                last_error_ = error;
+            }
+            // Failed rollback keeps its error, connection and descriptors so
+            // the caller can retry Unmount rather than lose accepted mounts.
             return false;
         }
         mounted_.push_back(s);
@@ -163,6 +169,7 @@ bool MasterSession::Unmount() {
         }
     }
     mounted_ = std::move(failed);
+    if (mounted_.empty()) last_error_ = mooncake::ErrorCode::OK;
     return mounted_.empty();
 }
 void MasterSession::Disconnect() {

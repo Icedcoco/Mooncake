@@ -116,6 +116,15 @@ ItemResult OperationExecutor::Observe(const std::string& key,
         item.error = response.error();
         return item;
     }
+    if (entry && entry->uncertain &&
+        std::any_of(response->replicas.begin(), response->replicas.end(),
+                    [](const auto& descriptor) {
+                        return descriptor.status !=
+                               mooncake::ReplicaStatus::COMPLETE;
+                    })) {
+        item.error = ErrorCode::REPLICA_IS_NOT_READY;
+        return item;
+    }
     // A completed pending write can advance exactly once after a lost End
     // reply.
     if (pending != pending_.end() && !pending->second.remove &&
@@ -254,11 +263,10 @@ void OperationExecutor::Write(const OperationRequest& r,
     for (size_t k = 0; k < revoke.size(); ++k) {
         const auto i = indices[revoke[k]];
         if (revoked[k]) {
-            const auto* previous = shadow_.Lookup(r.objects[i].key);
-            // Revoke restores the previous Upsert value, or absence for a new
-            // allocation. Keep an absence record for final validation.
-            if (!previous || !previous->exists)
-                shadow_.ApplyRemove(r.objects[i].key);
+            // MEMORY revoke deletes processing replicas, including the old
+            // replicas reused by UpsertStart. It does not restore old data.
+            shadow_.ApplyRemove(r.objects[i].key);
+            allocations_.erase(r.objects[i].key);
         } else {
             auto j = revoke[k], i = indices[j];
             Unknown(r.objects[i], *starts[j], false);

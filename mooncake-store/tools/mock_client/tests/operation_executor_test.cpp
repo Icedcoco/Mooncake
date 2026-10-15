@@ -71,6 +71,89 @@ TEST(OperationExecutorTest, UpsertUsesOwnSingleAndBatchLifecycle) {
         EXPECT_TRUE(shadow.Lookup("key0")->exists);
     }
 }
+TEST(OperationExecutorTest, SuccessfulUpsertRevokeDeletesPreviousValue) {
+    for (auto form : {OperationForm::Single, OperationForm::Batch}) {
+        FakeMasterApi api;
+        api.starts = {std::vector{MemoryDescriptor()}};
+        api.ends = {VoidResult{}};
+        ShadowModel shadow;
+        OperationExecutor executor(api, ExecutorConfig(), shadow);
+        ASSERT_TRUE(
+            executor.Execute(Request(LogicalOperation::Put, form)).ok());
+        api.keys.clear();
+        api.calls.clear();
+        api.end_result =
+            tl::make_unexpected(mooncake::ErrorCode::INTERNAL_ERROR);
+        api.ends = {api.end_result};
+        api.revokes = {VoidResult{}};
+        auto request = Request(LogicalOperation::Upsert, form);
+        request.objects.front().generation = 2;
+        request.objects.front().checksum = 456;
+        auto result = executor.Execute(request);
+        ASSERT_EQ(result.items.size(), 1);
+        EXPECT_EQ(result.items.front().error,
+                  mooncake::ErrorCode::INTERNAL_ERROR);
+        EXPECT_EQ(api.calls,
+                  form == OperationForm::Single
+                      ? (std::vector<std::string>{"UpsertStart", "UpsertEnd",
+                                                  "UpsertRevoke"})
+                      : (std::vector<std::string>{"BatchUpsertStart",
+                                                  "BatchUpsertEnd",
+                                                  "BatchUpsertRevoke"}));
+        ASSERT_NE(shadow.Lookup("key0"), nullptr);
+        EXPECT_FALSE(shadow.Lookup("key0")->exists);
+        EXPECT_TRUE(shadow.CanMutate("key0"));
+        api.gets = {tl::make_unexpected(mooncake::ErrorCode::OBJECT_NOT_FOUND)};
+        EXPECT_TRUE(executor.ValidateAll().ok());
+    }
+}
+TEST(OperationExecutorTest, IncompletePendingReadStaysUnknownUntilComplete) {
+    FakeMasterApi api;
+    api.starts = {std::vector{MemoryDescriptor()}};
+    api.end_result = tl::make_unexpected(mooncake::ErrorCode::RPC_TIMEOUT);
+    ShadowModel shadow;
+    OperationExecutor executor(api, ExecutorConfig(), shadow);
+    ASSERT_TRUE(
+        executor.Execute(Request(LogicalOperation::Put)).transport_unknown);
+    auto descriptor = MemoryDescriptor();
+    api.gets = {
+        mooncake::GetReplicaListResponse{std::vector{descriptor}, 0, 123}};
+    auto result = executor.ReconcileUnknown();
+    ASSERT_EQ(result.items.size(), 1);
+    EXPECT_EQ(result.items.front().error,
+              mooncake::ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_FALSE(result.items.front().validation_mismatch);
+    EXPECT_FALSE(shadow.CanMutate("key0"));
+    descriptor.status = mooncake::ReplicaStatus::COMPLETE;
+    api.gets = {
+        mooncake::GetReplicaListResponse{std::vector{descriptor}, 0, 123}};
+    EXPECT_TRUE(executor.ReconcileUnknown().ok());
+    EXPECT_TRUE(shadow.CanMutate("key0"));
+    EXPECT_EQ(shadow.Lookup("key0")->identity.generation, 1);
+}
+TEST(OperationExecutorTest,
+     IncompleteSessionFrozenReadStaysUnknownUntilComplete) {
+    FakeMasterApi api;
+    api.starts = {std::vector{MemoryDescriptor()}};
+    ShadowModel shadow;
+    OperationExecutor executor(api, ExecutorConfig(), shadow);
+    ASSERT_TRUE(executor.Execute(Request(LogicalOperation::Put)).ok());
+    shadow.MarkUnknown("key0");
+    auto descriptor = MemoryDescriptor();
+    api.gets = {
+        mooncake::GetReplicaListResponse{std::vector{descriptor}, 0, 123}};
+    auto result = executor.ReconcileUnknown();
+    ASSERT_EQ(result.items.size(), 1);
+    EXPECT_EQ(result.items.front().error,
+              mooncake::ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_FALSE(result.items.front().validation_mismatch);
+    EXPECT_FALSE(shadow.CanMutate("key0"));
+    descriptor.status = mooncake::ReplicaStatus::COMPLETE;
+    api.gets = {
+        mooncake::GetReplicaListResponse{std::vector{descriptor}, 0, 123}};
+    EXPECT_TRUE(executor.ReconcileUnknown().ok());
+    EXPECT_TRUE(shadow.CanMutate("key0"));
+}
 TEST(OperationExecutorTest, GetsAndRemovesUseSelectedForm) {
     for (auto form : {OperationForm::Single, OperationForm::Batch}) {
         FakeMasterApi api;
