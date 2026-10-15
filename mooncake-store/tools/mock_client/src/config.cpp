@@ -183,6 +183,49 @@ void ParseClients(const Json::Value& root, MockClientConfig* config) {
     }
 }
 
+void ParseReplication(const Json::Value& root, MockClientConfig* config) {
+    config->tenant_id =
+        ReadString(root["run"], "tenant_id", "run.tenant_id", "default");
+    if (!root.isMember("replication")) return;
+    auto r = RequireObject(root, "replication", "replication");
+    auto& c = config->replication;
+    c.replica_num =
+        ReadUnsigned(r, "replica_num", "replication.replica_num", 1, true);
+    c.nof_replica_num =
+        ReadUnsigned(r, "nof_replica_num", "replication.nof_replica_num", 0);
+    c.dfs_replica_num =
+        ReadUnsigned(r, "dfs_replica_num", "replication.dfs_replica_num", 0);
+    if (c.nof_replica_num || c.dfs_replica_num)
+        Fail("metadata-only mode supports MEMORY replicas only");
+    c.preferred_segments = ReadStringList(
+        r, "preferred_segments", "replication.preferred_segments", false);
+    c.preferred_segment =
+        ReadString(r, "preferred_segment", "replication.preferred_segment");
+    c.host_id = ReadString(r, "host_id", "replication.host_id");
+    auto boolean = [&](const char* name, bool fallback) {
+        if (!r.isMember(name)) return fallback;
+        if (!r[name].isBool())
+            Fail(std::string("replication.") + name + " must be boolean");
+        return r[name].asBool();
+    };
+    c.with_hard_pin = boolean("with_hard_pin", false);
+    c.prefer_alloc_in_same_node = boolean("prefer_alloc_in_same_node", false);
+    auto pin = ReadString(r, "soft_pin_action", "replication.soft_pin_action",
+                          "preserve");
+    if (pin == "preserve")
+        c.soft_pin_action = mooncake::SoftPinAction::PRESERVE;
+    else if (pin == "enable")
+        c.soft_pin_action = mooncake::SoftPinAction::ENABLE;
+    else if (pin == "disable")
+        c.soft_pin_action = mooncake::SoftPinAction::DISABLE;
+    else
+        Fail(
+            "replication.soft_pin_action must be preserve, enable, or disable");
+    if (r.isMember("soft_pin_ttl_ms"))
+        c.soft_pin_ttl_ms = ReadUnsigned(
+            r, "soft_pin_ttl_ms", "replication.soft_pin_ttl_ms", 0, true);
+}
+
 }  // namespace
 
 tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
@@ -237,6 +280,7 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
             config.scrape_interval_ms, true);
 
         ParseClients(root, &config);
+        ParseReplication(root, &config);
 
         const Json::Value workload =
             RequireObject(root, "workload", "workload");

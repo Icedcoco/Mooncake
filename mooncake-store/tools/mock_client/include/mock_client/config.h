@@ -10,6 +10,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "mock_client/operation_selection.h"
+#include "replica.h"
 
 namespace mock_client {
 
@@ -44,6 +45,8 @@ struct MockClientConfig {
     uint32_t scrape_interval_ms = 1000;
 
     std::vector<MockClientDefinition> clients;
+    mooncake::ReplicateConfig replication;
+    std::string tenant_id = "default";
 
     std::string workload_profile;
     uint64_t target_logical_ops_per_second = 0;

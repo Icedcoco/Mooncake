@@ -162,4 +162,30 @@ TEST(MockClientConfigTest, RejectsEmptyJsonOperationSelection) {
     EXPECT_FALSE(Load(config).has_value());
 }
 
+TEST(MockClientConfigTest, RejectsUnsupportedDiskReplication) {
+    for (const auto* field : {"nof_replica_num", "dfs_replica_num"}) {
+        auto config = ValidConfig();
+        config["replication"][field] = 1;
+        EXPECT_FALSE(Load(config));
+    }
+}
+TEST(MockClientConfigTest, PreservesMemoryReplicationAndTenantPolicy) {
+    auto config = ValidConfig();
+    config["replication"]["replica_num"] = 2;
+    config["replication"]["preferred_segments"].append("segment-a");
+    config["replication"]["with_hard_pin"] = true;
+    config["replication"]["soft_pin_action"] = "enable";
+    config["replication"]["soft_pin_ttl_ms"] = 1234;
+    config["run"]["tenant_id"] = "tenant-a";
+    auto loaded = Load(config);
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->replication.replica_num, 2);
+    EXPECT_EQ(loaded->replication.preferred_segments,
+              (std::vector<std::string>{"segment-a"}));
+    EXPECT_TRUE(loaded->replication.with_hard_pin);
+    EXPECT_EQ(loaded->replication.soft_pin_action,
+              mooncake::SoftPinAction::ENABLE);
+    EXPECT_EQ(loaded->replication.soft_pin_ttl_ms, 1234);
+    EXPECT_EQ(loaded->tenant_id, "tenant-a");
+}
 }  // namespace mock_client
