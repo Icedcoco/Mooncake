@@ -270,9 +270,11 @@ print(json.dumps({'time':__import__('time').time(),'free_bytes':shutil.disk_usag
             ).strip()
             == "True"
         )
+        # key 和 segment 名称都进入 OpLog，固定为上一轮 r10m3 的82字节。
+        assert len(case.encode("ascii")) <= 82
         config = {
             "endpoint": "10.1.100.8:45151",
-            "run_id": case,
+            "run_id": case.ljust(82, "x"),
             "workers": 2,
             "batch_size": 128,
             "duration_seconds": seconds,

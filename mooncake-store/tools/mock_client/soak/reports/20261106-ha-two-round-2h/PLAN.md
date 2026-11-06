@@ -17,6 +17,7 @@ master 为 madsys-02（10.1.100.8），standby 为 madsys-01（10.1.100.3）和 
 |---|---|
 | 供压 | 2 workers；每次 BatchPutStart/BatchPutEnd 最多 128 对象；不设置固定速率上限 |
 | 对象与 segment | 1KiB 对象；单副本；256MiB 虚拟 segment；无实际数据面内存分配 |
+| key/segment 命名 | run_id 前缀固定为 82 个 ASCII 字节，与上一轮 r10m3 一致；两轮使用相同长度，防止名称变化改变 OpLog 编码量 |
 | 验证 | 每 16 个 batch 检查地址、长度、副本标识、状态和 checksum 元数据 |
 | master | HA、OpLog、Snapshot 全开；RPC 线程 16；offload_on_evict=false |
 | OpLog | 每 batch 最多 8192 entries；standby 每次最多读取 16 batch；已有 Serializable Range 配置随验证过的二进制保留 |
@@ -42,7 +43,7 @@ python3 -m unittest test_statistics.py test_process_identity.py
 python3 -u run_suite.py --seconds 60 --label smoke02 > smoke02.log 2>&1
 
 # 正式两轮顺序执行；正式启动时由独立会话托管，不依赖终端保持连接。
-python3 -u run_suite.py --seconds 7200 --label long01 > long01.log 2>&1
+python3 -u run_suite.py --seconds 7200 --label long02 > long02.log 2>&1
 ```
 
 程序用 `suite.lock` 排斥重叠测试；每个进程保存 PID、启动时间与完整命令，停止时逐项核对。
