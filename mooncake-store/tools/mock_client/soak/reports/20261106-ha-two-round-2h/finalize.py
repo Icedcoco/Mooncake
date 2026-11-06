@@ -6,8 +6,11 @@ from pathlib import Path
 import sys
 import time
 
+from statistics_report import generate
+
 
 HERE = Path(__file__).resolve().parent
+processed = set()
 
 
 def read(path):
@@ -37,10 +40,20 @@ def render(label):
         "",
     ]
     links = []
+    finalized_cases = {r["case"] for r in suite.get("rounds", [])}
     for workload in ("put-evict", "put-remove"):
         case = label + "-" + workload
         root = HERE / case
         run = read(root / "run.json")
+        if case in finalized_cases and case not in processed:
+            try:
+                generate(root)
+            except Exception as error:
+                (root / "FINALIZATION-ERROR.md").write_text(
+                    f"最新统计汇总失败：{error!r}\n"
+                )
+                issues += [f"{case} 最新统计汇总失败：{error!r}", ""]
+            processed.add(case)
         summary = read(root / "summary.json")
         status = read(root / "live-status.json")
         progress = status.get("madsys-03", {}).get("client", {}).get("elapsed", 0)

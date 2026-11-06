@@ -186,6 +186,8 @@ def node_minutes(path, start, seconds):
             "ha_snapshot_latest_batch",
             "ha_snapshot_compaction_floor",
             "ha_snapshot_count",
+            "ha_snapshot_latest_age_seconds",
+            "ha_snapshot_uncompacted_batches",
             "mooncake_ha_batch_oplog_pruner_floor_lag_batch_ids",
         ]:
             out[key + "_last"] = b.get(key)
@@ -217,6 +219,15 @@ def node_minutes(path, start, seconds):
             for kind in ["operations", "errors"]:
                 key = "ha_snapshot_" + kind + '_total{operation="' + op + '"}'
                 out["snapshot_" + op + "_" + kind + "_delta"] = counter_delta(a, b, key)
+        for reason in [
+            "capture_unavailable",
+            "catch_up",
+            "lease_busy",
+            "no_fallback",
+            "invalid_pair",
+        ]:
+            key = 'ha_snapshot_skips_total{reason="' + reason + '"}'
+            out["snapshot_skip_" + reason + "_delta"] = counter_delta(a, b, key)
         for tag, key in [
             ("encode", "ha_batch_record_encode_latency_us"),
             ("decode", "ha_batch_record_decode_latency_us"),
@@ -508,6 +519,23 @@ def generate(root):
                     "核对事件日志具体错误及后续重试是否恢复。",
                 )
             )
+        age = max(
+            (m.get(host + "_ha_snapshot_latest_age_seconds_max") or 0 for m in minutes),
+            default=0,
+        )
+        unavailable = sum(
+            m.get(host + "_snapshot_skip_capture_unavailable_delta") or 0
+            for m in minutes
+        )
+        if host != "madsys-02" and age > 600 and unavailable:
+            warnings.append(
+                (
+                    host + " 多轮无法截取Snapshot",
+                    "Snapshot/standby",
+                    f"最大快照年龄={age}s（配置间隔60s），capture_unavailable跳过={unavailable}次；这属于未取得可发布快照，不等同于上传报错。",
+                    "截取要求可用的回放边界；需结合standby lag及跳过时间线核实是否被持续追赶阻碍。快照和floor长时间不推进会延长OpLog保留，不能仅凭errors=0判定维护正常。",
+                )
+            )
         leader_changes = sum(
             m.get(host + "_etcd_server_leader_changes_seen_total_delta") or 0
             for m in minutes
@@ -521,6 +549,15 @@ def generate(root):
                     "对齐资源/心跳与compaction，不仅凭次数判断原因。",
                 )
             )
+    if run.get("standby_caught_up") is False:
+        warnings.append(
+            (
+                "供压停止后standby未在收尾窗口内追平",
+                "standby/资源",
+                "控制器等待最多90秒，未观察到两个standby均追到稳定durable_prefix。",
+                "核对最终lag、回放吞吐和是否仍有收尾写入；与丢失对象或错误位置分开判断。",
+            )
+        )
     if done.get("mismatch", 0) or done.get("unknown", 0):
         warnings.append(
             (
@@ -553,7 +590,7 @@ client 成功回调={done.get('success')}，Remove成功={done.get('remove_succe
 HA-002的callback/durable差异作为既定语义记录，不改生产代码掩盖差异。
 最终日志记录的 PutEnd 入队失败={summary['putend_queue_rejected']}；callback 减入队失败再减完整 durable PUT_END 的剩余差异={summary.get('callback_reconciliation_difference')}。
 
-配置：2 workers，client batch=128，1KiB对象，单副本，256MiB模拟segment；put_remove保留65536个成功key的存量窗口，先删除再补入；HA+OpLog+Snapshot开启，master=madsys-02，standby=madsys-01/03，RPC线程16，OpLog batch上限8192，standby每次最多读取16 batch，prune chunk=10/max=50 batch/s，Snapshot间隔60s/chunk100000，offload_on_evict=false。etcd三节点3.5.33、periodic保留5m、compaction limit=8/sleep=100ms、backend interval=100ms/limit10000、snapshot-count1000、quota24GiB/maxrequest8MiB。
+配置：2 workers，client batch=128，1KiB对象，单副本，256MiB模拟segment；正式long02的run_id前缀固定82字节，与之前r10m3长度一致；put_remove保留65536个成功key的存量窗口，先删除再补入；HA+OpLog+Snapshot开启，master=madsys-02，standby=madsys-01/03，RPC线程16，OpLog batch上限8192，standby每次最多读取16 batch，prune chunk=10/max=50 batch/s，Snapshot间隔60s/chunk100000，offload_on_evict=false。etcd三节点3.5.33、periodic保留5m、compaction limit=8/sleep=100ms、backend interval=100ms/limit10000、snapshot-count1000、quota24GiB/maxrequest8MiB。
 二进制来源及SHA256见 build-manifest.json，逐节点实际启动命令见 deployment.json；两轮复用相同二进制，每轮使用新的专用etcd数据与cluster id。
 
 逐分钟统计在 `per-minute.csv`（UTF-8带BOM，逗号分隔），共{len(minutes)}行。窗口以client开始时间为原点，左闭右开；durable按审计确认时间归窗，存在watch传输/采集延迟，并非服务端精确commit时间。数值0表示未观察到事件，缺失的监控字段留空；`samples`、`sample_span_s`和`supply_seconds`用于判断窗口是否完整。发生审计失败时，全部durable统计应视为无效，不能把零当作正常吞吐。
