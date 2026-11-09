@@ -16,8 +16,8 @@ REPO = next(
 HERE = Path(os.environ.get("MOONCAKE_PRESSURE_RESULTS", str(CODE_DIR)))
 LAB = "/opt/mooncake-lab/20261015"
 REMOTE = LAB + "/results/ha-durable-six-20261109"
-SOURCE = LAB + "/src-ha-durable-six-20261109"
-BUILD = LAB + "/build-ha-durable-six-20261109"
+SOURCE = LAB + "/src-ha-durable-six-20261109-r02"
+BUILD = LAB + "/build-ha-durable-six-20261109-r02"
 HOSTS = ("madsys-01", "madsys-02", "madsys-03")
 GO = "/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.10.linux-amd64/bin"
 
@@ -88,6 +88,51 @@ print('源码已展开：'+commit)
         ),
         flush=True,
     )
+    dependency_commit = "54f9c0642386e7860e8e11ada698c484dc562d7d"
+    dependency_sha = "11040b1d3f859599e5453ef7e9b5f84f8afa2388b057330f4c667973e5b20f01"
+    dependency_archive = HERE / "yalantinglibs-54f9c064.tar.gz"
+    assert dependency_commit in (REPO / "mooncake-common/FindYLT.cmake").read_text()
+    if not dependency_archive.exists():
+        subprocess.run(
+            [
+                "curl",
+                "-sSL",
+                "--fail",
+                "--max-time",
+                "300",
+                "https://codeload.github.com/alibaba/yalantinglibs/tar.gz/"
+                + dependency_commit,
+                "-o",
+                str(dependency_archive),
+            ],
+            check=True,
+        )
+    assert hashlib.sha256(dependency_archive.read_bytes()).hexdigest() == dependency_sha
+    subprocess.run(
+        [
+            "scp",
+            "-q",
+            str(dependency_archive),
+            "madsys-01:" + REMOTE + "/yalantinglibs.tar.gz",
+        ],
+        check=True,
+    )
+    dependency_source = LAB + "/deps/fetch/yalantinglibs-" + dependency_commit
+    print(
+        remote_code(
+            "madsys-01",
+            f"""from pathlib import Path
+import tarfile,hashlib
+arc=Path({REMOTE!r})/'yalantinglibs.tar.gz'
+assert hashlib.sha256(arc.read_bytes()).hexdigest()=={dependency_sha!r}
+d=Path({dependency_source!r})
+if not d.exists():
+ with tarfile.open(arc) as tf: tf.extractall(d.parent)
+print('依赖校验通过：'+str(d))
+""",
+        ),
+        flush=True,
+    )
     configure = [
         "cmake",
         "-S",
@@ -118,9 +163,7 @@ print('源码已展开：'+commit)
         "-DWITH_STORE_C_SHARED=OFF",
         "-DWITH_EP=OFF",
         "-DMOONCAKE_ENABLE_OPLOG_PERF_METRICS=ON",
-        "-DFETCHCONTENT_SOURCE_DIR_YALANTINGLIBS="
-        + LAB
-        + "/deps/fetch/yalantinglibs-src",
+        "-DFETCHCONTENT_SOURCE_DIR_YALANTINGLIBS=" + dependency_source,
         "-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=" + LAB + "/deps/fetch/googletest-src",
         "-DCMAKE_PREFIX_PATH=" + LAB + "/deps/aws",
     ]
@@ -170,7 +213,7 @@ import shutil,json,subprocess,hashlib
 b=Path({BUILD!r}); d=Path({REMOTE!r})
 files={{'bin/mooncake_master':b/'mooncake-store/src/mooncake_master','bin/comparison-pressure':b/'mooncake-store/tools/mock_client/mooncake_durable_pressure','bin/mooncake_master_mock_client':b/'mooncake-store/tools/mock_client/mooncake_master_mock_client','lib/libetcd_wrapper.so':b/'mooncake-common/etcd/libetcd_wrapper.so','lib/libasio.so':b/'mooncake-common/src/libasio.so'}}
 for dst,src in files.items(): shutil.copy2(src,d/dst)
-manifest={{'source_commit':{commit!r},'source_archive_sha256':{source_sha!r},'build_host':'madsys-01','files':{{dst:hashlib.sha256((d/dst).read_bytes()).hexdigest() for dst in files}},'go_version':subprocess.check_output([{GO!r}+'/go','version'],text=True),'compiler':subprocess.check_output(['g++','--version'],text=True).splitlines()[0]}}
+manifest={{'source_commit':{commit!r},'source_archive_sha256':{source_sha!r},'build_host':'madsys-01','yalantinglibs_commit':{dependency_commit!r},'yalantinglibs_archive_sha256':{dependency_sha!r},'files':{{dst:hashlib.sha256((d/dst).read_bytes()).hexdigest() for dst in files}},'go_version':subprocess.check_output([{GO!r}+'/go','version'],text=True),'compiler':subprocess.check_output(['g++','--version'],text=True).splitlines()[0]}}
 (d/'build-manifest.json').write_text(json.dumps(manifest,indent=2))
 print(json.dumps(manifest))
 """,
