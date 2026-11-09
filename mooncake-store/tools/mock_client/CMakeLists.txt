@@ -45,6 +45,8 @@ target_link_libraries(mooncake_durable_pressure PRIVATE mock_client_master_api)
 if(BUILD_UNIT_TESTS)
   add_executable(mock_client_live_window_test
                  soak/reports/20261106-ha-two-round-2h/window_test.cpp)
+  # This standalone test uses assert(), including in optimized lab builds.
+  target_compile_options(mock_client_live_window_test PRIVATE -UNDEBUG)
   add_test(NAME mock_client_live_window_test
            COMMAND mock_client_live_window_test)
 endif()
