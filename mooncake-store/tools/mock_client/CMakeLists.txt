@@ -37,3 +37,14 @@ if(BUILD_UNIT_TESTS)
                                                       gtest_main pthread)
   add_test(NAME mock_client_core_test COMMAND mock_client_core_test)
 endif()
+
+# Build the paired pressure runner with the same library as the deployed master.
+add_executable(mooncake_durable_pressure
+               soak/reports/20261106-ha-two-round-2h/pressure.cpp)
+target_link_libraries(mooncake_durable_pressure PRIVATE mock_client_master_api)
+if(BUILD_UNIT_TESTS)
+  add_executable(mock_client_live_window_test
+                 soak/reports/20261106-ha-two-round-2h/window_test.cpp)
+  add_test(NAME mock_client_live_window_test
+           COMMAND mock_client_live_window_test)
+endif()

@@ -10,19 +10,19 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
-import sys
 import tarfile
 import time
 import traceback
 from statistics_report import generate
 
-HERE = Path(__file__).resolve().parent
-REMOTE = "/opt/mooncake-lab/20261015/results/ha-two-round-20261106"
+CODE_DIR = Path(__file__).resolve().parent
+HERE = Path(os.environ.get("MOONCAKE_PRESSURE_RESULTS", str(CODE_DIR)))
+REMOTE = os.environ.get(
+    "MOONCAKE_PRESSURE_REMOTE",
+    "/opt/mooncake-lab/20261015/results/ha-durable-six-20261109",
+)
 HOSTS = ("madsys-01", "madsys-02", "madsys-03")
-sys.path.insert(0, str(HERE.parent / "20261104-ha-oplog-floor-serializable/r08"))
-import etcd_control as ctl  # noqa: E402 - 显式加载已验证的专用集群部署工具。
-
-sys.path.insert(0, str(HERE.parent / "20261105-compaction-isolation"))
+import etcd_control as ctl  # noqa: E402
 from lifecycle import stop_cluster  # noqa: E402
 
 ctl.REMOTE = REMOTE
@@ -66,13 +66,9 @@ def wait_for(fn, seconds=90):
 
 
 def deploy_scripts():
-    template = next(
-        (HERE.parent / "20261105-compaction-isolation").glob(
-            "D-w2-*-r10m3/madsys-02/deployment.json"
-        )
-    )
+    template = CODE_DIR / "master-template.json"
     for h in HOSTS:
-        for src in [HERE / "node.py", HERE / "statistics_report.py", template]:
+        for src in [CODE_DIR / "node.py", CODE_DIR / "statistics_report.py", template]:
             name = "master-template.json" if src == template else src.name
             subprocess.run(
                 ["scp", "-q", str(src), h + ":" + REMOTE + "/" + name],
@@ -525,6 +521,7 @@ def main():
     )
     args = p.parse_args()
     assert args.seconds > 0
+    HERE.mkdir(parents=True, exist_ok=True)
     lock = (HERE / "suite.lock").open("w")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 

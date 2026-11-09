@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -9,7 +10,9 @@ import time
 from statistics_report import generate
 
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(
+    os.environ.get("MOONCAKE_PRESSURE_RESULTS", str(Path(__file__).resolve().parent))
+)
 processed = set()
 
 

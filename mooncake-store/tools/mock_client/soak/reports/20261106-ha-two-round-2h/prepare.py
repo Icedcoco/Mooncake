@@ -1,119 +1,208 @@
-"""仅在 madsys-01 编译供压工具；master 和依赖直接复用已验证 SHA256。"""
+"""在 madsys-01 单线程构建本分支，测试后向三台专用测试节点部署。"""
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 
-HERE = Path(__file__).resolve().parent
-REMOTE = "/opt/mooncake-lab/20261015/results/ha-two-round-20261106"
-OLD = "/opt/mooncake-lab/20261015/results/compaction-isolation-20261105-r09/master"
+CODE_DIR = Path(__file__).resolve().parent
+REPO = next(
+    p
+    for p in CODE_DIR.parents
+    if (p / "CMakeLists.txt").exists() and (p / ".git").exists()
+)
+HERE = Path(os.environ.get("MOONCAKE_PRESSURE_RESULTS", str(CODE_DIR)))
+LAB = "/opt/mooncake-lab/20261015"
+REMOTE = LAB + "/results/ha-durable-six-20261109"
+SOURCE = LAB + "/src-ha-durable-six-20261109"
+BUILD = LAB + "/build-ha-durable-six-20261109"
 HOSTS = ("madsys-01", "madsys-02", "madsys-03")
+GO = "/root/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.10.linux-amd64/bin"
 
 
-def ssh(h, code, timeout=30):
+def ssh(host, command, timeout=60):
     return subprocess.check_output(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", h, code],
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, command],
         text=True,
         timeout=timeout,
     )
 
 
+def remote_code(host, code, timeout=60):
+    return ssh(host, "python3 -c " + shlex.quote(code), timeout)
+
+
 def main():
-    expected = json.loads(
-        (HERE.parent / "20261105-compaction-isolation/execution-r10m3.json").read_text()
-    )["deployment_checks"]["madsys-01"]["hashes"]
-    records = {}
-    for h in HOSTS:
-        code = """from pathlib import Path
-import json,hashlib,shutil,subprocess,re
-p=Path(%r); old=Path(%r)
-assert not [x for x in subprocess.check_output(['ss','-ltnp'],text=True).splitlines() if re.search(r':(?:12479|12480|45151|49103|48180)\\b',x)]
-assert shutil.disk_usage(p.parent).free > 24*1024**3
-for sub in ['bin','lib']: (p/sub).mkdir(parents=True,exist_ok=True)
-for rel in ['bin/mooncake_master','lib/libasio.so','lib/libetcd_wrapper.so']: shutil.copy2(old/rel,p/rel)
-print(json.dumps({rel:hashlib.sha256((p/rel).read_bytes()).hexdigest() for rel in ['bin/mooncake_master','lib/libasio.so','lib/libetcd_wrapper.so']}))
-""" % (REMOTE, OLD)
-        hashes = json.loads(ssh(h, "python3 -c " + shlex.quote(code)))
-        assert hashes["bin/mooncake_master"] == expected["mooncake_master"]
-        assert hashes["lib/libasio.so"] == expected["libasio.so"]
-        assert (
-            hashes["lib/libetcd_wrapper.so"]
-            == "9948af4c27e355fbf625a373bdfdbddefdf3a3cd999429abf4b7889f4aa83ea4"
+    HERE.mkdir(parents=True, exist_ok=True)
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO, text=True
+    ).strip()
+    assert not subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO
+    ).strip(), "必须先提交代码再构建"
+    for host in HOSTS:
+        print(
+            host,
+            remote_code(
+                host,
+                f"""from pathlib import Path
+import shutil,subprocess,re,json
+p=Path({REMOTE!r}); p.mkdir(parents=True,exist_ok=True)
+assert not [x for x in subprocess.check_output(['ss','-ltnp'],text=True).splitlines() if re.search(r':(?:12479|12480|45151|49103|48180)\\b',x)], '测试端口仍被占用'
+assert shutil.disk_usage(p).free>24*1024**3, '磁盘余量不足24GiB'
+for name in ['bin','lib']: (p/name).mkdir(exist_ok=True)
+print(json.dumps({{'free_bytes':shutil.disk_usage(p).free}}))
+""",
+            ),
+            flush=True,
         )
-        records[h] = hashes
-    for name in ["pressure.cpp", "window.h", "window_test.cpp"]:
-        subprocess.run(
-            ["scp", "-q", str(HERE / name), "madsys-01:" + REMOTE + "/" + name],
-            check=True,
-        )
-    spec = json.loads(
-        (HERE.parent / "20261018-ha-evict-comparison/build-command.json").read_text()
+    archive = HERE / "source.tar.gz"
+    subprocess.run(
+        ["git", "archive", "--format=tar.gz", "-o", str(archive), commit],
+        cwd=REPO,
+        check=True,
     )
-    root = "/home/kyc/orca/workspaces/Mooncake/ha-lab-preserve-202610"
-    build = "/opt/mooncake-lab/20261015/build-ha-oplog-longtail-r07"
-    source = "/opt/mooncake-lab/20261015/src-ha-oplog-longtail-r07"
-
-    def replace(v):
-        old = (
-            root
-            + "/mooncake-store/tools/mock_client/soak/reports/20261018-ha-evict-comparison/pressure"
-        )
-        if v in (old, old + ".cpp", old + ".o"):
-            return REMOTE + (
-                "/bin/comparison-pressure" if v == old else "/pressure" + v[len(old) :]
-            )
-        return (
-            v.replace(
-                root + "/build/_deps/yalantinglibs-src",
-                "/opt/mooncake-lab/20261015/deps/fetch/yalantinglibs-src",
-            )
-            .replace(root + "/build", build)
-            .replace(root, source)
-        )
-
-    commands = [([replace(x) for x in cmd], replace(cwd)) for cmd, cwd in spec]
-    (HERE / "build-command.json").write_text(json.dumps(commands, indent=2) + "\n")
-    ssh(
-        "madsys-01",
-        "cd "
-        + shlex.quote(REMOTE)
-        + " && g++ -std=c++17 window_test.cpp -o window-test && ./window-test",
+    source_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+    subprocess.run(
+        ["scp", "-q", str(archive), "madsys-01:" + REMOTE + "/source.tar.gz"],
+        check=True,
     )
-    for cmd, cwd in commands:
-        print("在 madsys-01 串行编译/链接", cmd[0], flush=True)
-        ssh(
+    print(
+        remote_code(
             "madsys-01",
-            "cd " + shlex.quote(cwd) + " && " + shlex.join(cmd),
-            timeout=300,
-        )
+            f"""from pathlib import Path
+import hashlib,json,tarfile,shutil
+root=Path({SOURCE!r}); commit={commit!r}; arc=Path({REMOTE!r})/'source.tar.gz'
+assert hashlib.sha256(arc.read_bytes()).hexdigest()=={source_sha!r}
+if root.exists(): assert (root/'BUILD-SOURCE.json').exists() and json.loads((root/'BUILD-SOURCE.json').read_text())['commit']==commit
+else:
+ root.mkdir()
+ with tarfile.open(arc) as tf: tf.extractall(root)
+ (root/'BUILD-SOURCE.json').write_text(json.dumps({{'commit':commit,'archive_sha256':{source_sha!r}}}))
+ p=root/'extern/pybind11'
+ if not (p/'CMakeLists.txt').exists(): shutil.copytree({LAB!r}+'/deps/pybind11',p,dirs_exist_ok=True)
+print('源码已展开：'+commit)
+""",
+        ),
+        flush=True,
+    )
+    configure = [
+        "cmake",
+        "-S",
+        SOURCE,
+        "-B",
+        BUILD,
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-O2 -g1 -DNDEBUG",
+        "-DWITH_STORE=ON",
+        "-DWITH_TE=ON",
+        "-DWITH_METRICS=ON",
+        "-DBUILD_MOCK_CLIENT=ON",
+        "-DBUILD_UNIT_TESTS=ON",
+        "-DBUILD_EXAMPLES=OFF",
+        "-DBUILD_BENCHMARK=OFF",
+        "-DSTORE_USE_ETCD=ON",
+        "-DSTORE_USE_REDIS=OFF",
+        "-DSTORE_USE_K8S_LEASE=OFF",
+        "-DSTORE_USE_JEMALLOC=OFF",
+        "-DUSE_CUDA=OFF",
+        "-DUSE_TENT=OFF",
+        "-DUSE_NOF=OFF",
+        "-DUSE_NVMEOF=OFF",
+        "-DUSE_TCP=ON",
+        "-DUSE_HTTP=ON",
+        "-DWITH_STORE_RUST=OFF",
+        "-DWITH_STORE_GO=OFF",
+        "-DWITH_STORE_C_SHARED=OFF",
+        "-DWITH_EP=OFF",
+        "-DMOONCAKE_ENABLE_OPLOG_PERF_METRICS=ON",
+        "-DFETCHCONTENT_SOURCE_DIR_YALANTINGLIBS="
+        + LAB
+        + "/deps/fetch/yalantinglibs-src",
+        "-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=" + LAB + "/deps/fetch/googletest-src",
+        "-DCMAKE_PREFIX_PATH=" + LAB + "/deps/aws",
+    ]
+    targets = [
+        "mooncake_master",
+        "mooncake_master_mock_client",
+        "mooncake_durable_pressure",
+        "mock_client_core_test",
+        "mock_client_live_window_test",
+        "oplog_batch_standby_reader_test",
+        "batch_oplog_pruning_worker_test",
+        "master_service_config_test",
+    ]
+    commands = [
+        configure,
+        ["cmake", "--build", BUILD, "--parallel", "1", "--target", *targets],
+        [
+            "ctest",
+            "--test-dir",
+            BUILD,
+            "--output-on-failure",
+            "-j1",
+            "-R",
+            "^(mock_client_core_test|mock_client_live_window_test|oplog_batch_standby_reader_test|batch_oplog_pruning_worker_test|master_service_config_test|etcd_wrapper_go_test)$",
+        ],
+    ]
+    (HERE / "build-command.json").write_text(json.dumps(commands, indent=2) + "\n")
+    for index, command in enumerate(commands):
+        print("madsys-01 执行：", shlex.join(command), flush=True)
+        script = f"""from pathlib import Path
+import subprocess,os,json,time
+cmd={command!r}; env=dict(os.environ,PATH={GO!r}+':'+os.environ['PATH'],GOMAXPROCS='1',GOPROXY='https://goproxy.cn,direct')
+log=Path({REMOTE!r})/'build-{index}.log'
+with log.open('w') as f:
+ p=subprocess.Popen(cmd,env=env,stdout=f,stderr=subprocess.STDOUT)
+ (Path({REMOTE!r})/'build-process.json').write_text(json.dumps({{'pid':p.pid,'command':cmd,'started':time.time()}}))
+ rc=p.wait()
+print(log.read_text()[-12000:])
+raise SystemExit(rc)
+"""
+        print(remote_code("madsys-01", script, timeout=10800), flush=True)
+    print(
+        remote_code(
+            "madsys-01",
+            f"""from pathlib import Path
+import shutil,json,subprocess,hashlib
+b=Path({BUILD!r}); d=Path({REMOTE!r})
+files={{'bin/mooncake_master':b/'mooncake-store/src/mooncake_master','bin/comparison-pressure':b/'mooncake-store/tools/mock_client/mooncake_durable_pressure','bin/mooncake_master_mock_client':b/'mooncake-store/tools/mock_client/mooncake_master_mock_client','lib/libetcd_wrapper.so':b/'mooncake-common/etcd/libetcd_wrapper.so','lib/libasio.so':b/'mooncake-common/src/libasio.so'}}
+for dst,src in files.items(): shutil.copy2(src,d/dst)
+manifest={{'source_commit':{commit!r},'source_archive_sha256':{source_sha!r},'build_host':'madsys-01','files':{{dst:hashlib.sha256((d/dst).read_bytes()).hexdigest() for dst in files}},'go_version':subprocess.check_output([{GO!r}+'/go','version'],text=True),'compiler':subprocess.check_output(['g++','--version'],text=True).splitlines()[0]}}
+(d/'build-manifest.json').write_text(json.dumps(manifest,indent=2))
+print(json.dumps(manifest))
+""",
+        ),
+        flush=True,
+    )
     subprocess.run(
         [
             "scp",
             "-q",
-            "madsys-01:" + REMOTE + "/bin/comparison-pressure",
-            str(HERE / "comparison-pressure"),
+            "madsys-01:" + REMOTE + "/build-manifest.json",
+            str(HERE / "build-manifest.json"),
         ],
         check=True,
     )
-    binary = HERE / "comparison-pressure"
-    sha = hashlib.sha256(binary.read_bytes()).hexdigest()
-    subprocess.run(
-        ["scp", "-q", str(binary), "madsys-03:" + REMOTE + "/bin/comparison-pressure"],
-        check=True,
-    )
-    assert (
-        ssh("madsys-03", "sha256sum " + REMOTE + "/bin/comparison-pressure").split()[0]
-        == sha
-    )
-    records["pressure_sha256"] = sha
-    records["pressure_source_sha256"] = hashlib.sha256(
-        (HERE / "pressure.cpp").read_bytes()
-    ).hexdigest()
-    records["master_source_commit"] = "8aac9fd427933a0809edc48f032329cd89588eef"
-    (HERE / "build-manifest.json").write_text(json.dumps(records, indent=2) + "\n")
-    print("构建和二进制校验完成", sha, flush=True)
+    manifest = json.loads((HERE / "build-manifest.json").read_text())
+    for rel, sha in manifest["files"].items():
+        path = HERE / "deployment" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["scp", "-q", "madsys-01:" + REMOTE + "/" + rel, str(path)], check=True
+        )
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == sha
+        for host in HOSTS[1:]:
+            subprocess.run(
+                ["scp", "-q", str(path), host + ":" + REMOTE + "/" + rel], check=True
+            )
+            assert (
+                ssh(host, "sha256sum " + shlex.quote(REMOTE + "/" + rel)).split()[0]
+                == sha
+            )
+    print("三节点部署和 SHA256 校验完成", flush=True)
 
 
 if __name__ == "__main__":

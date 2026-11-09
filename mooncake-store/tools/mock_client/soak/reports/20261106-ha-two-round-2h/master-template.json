@@ -1,0 +1,29 @@
+{
+  "args": [
+    "mooncake_master",
+    "--enable_ha=true",
+    "--enable_oplog=true",
+    "--enable_oplog_snapshot=true",
+    "--ha_backend_type=etcd",
+    "--ha_backend_connstring=10.1.100.3:12479;10.1.100.8:12479;10.1.101.3:12479",
+    "--cluster_id=template-cluster",
+    "--rpc_address=10.1.100.8",
+    "--rpc_port=45151",
+    "--rpc_thread_num=16",
+    "--metrics_host=10.1.100.8",
+    "--metrics_port=49103",
+    "--enable_http_metadata_server=true",
+    "--http_metadata_server_host=10.1.100.8",
+    "--http_metadata_server_port=48180",
+    "--eviction_high_watermark_ratio=0.95",
+    "--eviction_ratio=0.10",
+    "--offload_on_evict=false",
+    "--oplog_batch_max_entries=8192",
+    "--oplog_standby_max_batches_per_poll=16",
+    "--oplog_prune_chunk_batch_count=10",
+    "--oplog_prune_max_batches_per_second=50",
+    "--snapshot_object_store_type=local",
+    "--snapshot_interval_seconds=60",
+    "--snapshot_chunk_object_count=100000"
+  ]
+}

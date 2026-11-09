@@ -15,11 +15,12 @@ import time
 from urllib.request import urlopen
 from statistics_report import parse_metrics
 
-ROOT = Path("/opt/mooncake-lab/20261015/results/ha-two-round-20261106")
+ROOT = Path("/opt/mooncake-lab/20261015/results/ha-durable-six-20261109")
 LAB = Path("/opt/mooncake-lab/20261015")
 IPS = {"madsys-01": "10.1.100.3", "madsys-02": "10.1.100.8", "madsys-03": "10.1.101.3"}
 SNAPS = (
-    LAB / "results/ha-evict-comparison-20261018/shared-snapshots/ha-two-round-20261106"
+    LAB
+    / "results/ha-evict-comparison-20261018/shared-snapshots/ha-durable-six-20261109"
 )
 ETCD = [
     str(LAB / "bin/etcdctl"),
