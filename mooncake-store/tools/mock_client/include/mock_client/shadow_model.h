@@ -53,16 +53,15 @@ class ShadowModel {
     // An observed absence fully resolves uncertainty. Presence alone does not
     // identify the expected generation/checksum and therefore stays frozen;
     // use ReconcileReplicaList to confirm a complete known present state.
-    bool ResolveUnknown(std::string_view key,
-                        ShadowObservation observed_state);
+    bool ResolveUnknown(std::string_view key, ShadowObservation observed_state);
 
     const ShadowEntry* Lookup(std::string_view key) const;
     std::vector<std::string> KeysForValidation() const;
 
     // Compare a successful metadata query with the expected state and retain
     // only normalized replica summaries (never the input descriptors).
-    bool ReconcileReplicaList(
-        std::string_view key, const mooncake::GetReplicaListResponse& response);
+    bool ReconcileReplicaList(std::string_view key,
+                              const mooncake::GetReplicaListResponse& response);
 
    private:
     static ReplicaSummary Summarize(

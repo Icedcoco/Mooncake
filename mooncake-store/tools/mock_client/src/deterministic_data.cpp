@@ -11,8 +11,7 @@ constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
 constexpr uint64_t kFnvPrime = 1099511628211ULL;
 constexpr std::string_view kKeyDomain = "mooncake.mock-client.key.v1";
 constexpr std::string_view kSizeDomain = "mooncake.mock-client.size.v1";
-constexpr std::string_view kChecksumDomain =
-    "mooncake.mock-client.checksum.v1";
+constexpr std::string_view kChecksumDomain = "mooncake.mock-client.checksum.v1";
 
 void HashByte(uint64_t& hash, uint8_t byte) {
     hash ^= byte;
@@ -63,9 +62,9 @@ uint64_t StartHash(std::string_view domain, uint64_t seed,
 }
 
 void AppendHexByte(std::string& output, uint8_t value) {
-    constexpr std::array<char, 16> digits = {
-        '0', '1', '2', '3', '4', '5', '6', '7',
-        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    constexpr std::array<char, 16> digits = {'0', '1', '2', '3', '4', '5',
+                                             '6', '7', '8', '9', 'a', 'b',
+                                             'c', 'd', 'e', 'f'};
     output.push_back(digits[value >> 4]);
     output.push_back(digits[value & 0x0f]);
 }
@@ -74,9 +73,9 @@ template <typename Integer>
 void AppendFixedHex(std::string& output, Integer value) {
     static_assert(std::is_unsigned_v<Integer>);
     constexpr std::size_t kWidth = sizeof(Integer) * 2;
-    constexpr std::array<char, 16> digits = {
-        '0', '1', '2', '3', '4', '5', '6', '7',
-        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    constexpr std::array<char, 16> digits = {'0', '1', '2', '3', '4', '5',
+                                             '6', '7', '8', '9', 'a', 'b',
+                                             'c', 'd', 'e', 'f'};
     for (std::size_t nibble = 0; nibble < kWidth; ++nibble) {
         const auto shift = static_cast<unsigned>((kWidth - nibble - 1) * 4);
         output.push_back(digits[(value >> shift) & 0x0f]);
@@ -122,8 +121,7 @@ uint64_t DeterministicSize(uint64_t seed, std::string_view namespace_name,
     return min_size + (hash % range);
 }
 
-uint64_t DeterministicChecksum(uint64_t seed,
-                               std::string_view namespace_name,
+uint64_t DeterministicChecksum(uint64_t seed, std::string_view namespace_name,
                                uint32_t client_index, uint64_t object_index,
                                uint64_t generation, uint64_t logical_size) {
     uint64_t hash = StartHash(kChecksumDomain, seed, namespace_name,
@@ -135,16 +133,13 @@ uint64_t DeterministicChecksum(uint64_t seed,
 
 ObjectIdentity MakeObjectIdentity(uint64_t seed,
                                   std::string_view namespace_name,
-                                  uint32_t client_index,
-                                  uint64_t object_index,
-                                  uint64_t generation,
-                                  uint64_t logical_size) {
+                                  uint32_t client_index, uint64_t object_index,
+                                  uint64_t generation, uint64_t logical_size) {
     return ObjectIdentity{
         DeterministicKey(seed, namespace_name, client_index, object_index),
-        generation,
-        logical_size,
+        generation, logical_size,
         DeterministicChecksum(seed, namespace_name, client_index, object_index,
-                             generation, logical_size)};
+                              generation, logical_size)};
 }
 
 }  // namespace mock_client

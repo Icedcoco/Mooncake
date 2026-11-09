@@ -23,7 +23,8 @@ Json::Value ValidConfig() {
     root["master"]["endpoints"] = Json::Value(Json::arrayValue);
     root["master"]["endpoints"].append("127.0.0.1:50051");
     root["master"]["metrics_endpoints"] = Json::Value(Json::arrayValue);
-    root["master"]["metrics_endpoints"].append("http://127.0.0.1:50052/metrics");
+    root["master"]["metrics_endpoints"].append(
+        "http://127.0.0.1:50052/metrics");
     root["master"]["request_timeout_ms"] = 1000;
 
     Json::Value client(Json::objectValue);
@@ -64,10 +65,9 @@ class TemporaryConfigFile {
    public:
     explicit TemporaryConfigFile(const Json::Value& value) {
         static std::atomic<uint64_t> sequence{0};
-        const auto unique = std::chrono::steady_clock::now()
-                                .time_since_epoch()
-                                .count() +
-                            sequence.fetch_add(1);
+        const auto unique =
+            std::chrono::steady_clock::now().time_since_epoch().count() +
+            sequence.fetch_add(1);
         path_ = std::filesystem::temp_directory_path() /
                 ("mock-client-config-" + std::to_string(unique) + ".json");
         Json::StreamWriterBuilder builder;

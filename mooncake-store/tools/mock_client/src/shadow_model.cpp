@@ -83,7 +83,12 @@ bool ShadowModel::ApplyRemove(std::string_view key) {
     auto [it, inserted] = entries_.try_emplace(
         std::string(key),
         ShadowEntry{ObjectIdentity{std::string(key), 0, 0, std::nullopt},
-                    false, 0, {}, {}, {}, false});
+                    false,
+                    0,
+                    {},
+                    {},
+                    {},
+                    false});
     if (!inserted) {
         SetAbsent(it->second);
     }
@@ -97,7 +102,12 @@ void ShadowModel::MarkUnknown(std::string_view key) {
     auto [it, inserted] = entries_.try_emplace(
         std::string(key),
         ShadowEntry{ObjectIdentity{std::string(key), 0, 0, std::nullopt},
-                    false, 0, {}, {}, {}, true});
+                    false,
+                    0,
+                    {},
+                    {},
+                    {},
+                    true});
     if (!inserted) {
         it->second.uncertain = true;
     }
@@ -147,8 +157,8 @@ bool ShadowModel::ReconcileReplicaList(
     }
 
     ShadowEntry& entry = it->second;
-    const bool observed_present = !response.replicas.empty() ||
-                                  response.object_checksum.has_value();
+    const bool observed_present =
+        !response.replicas.empty() || response.object_checksum.has_value();
     if (!observed_present) {
         if (!entry.uncertain && entry.exists) {
             return false;
@@ -157,8 +167,8 @@ bool ShadowModel::ReconcileReplicaList(
         return true;
     }
 
-    if (!entry.exists || response.replicas.size() !=
-                             entry.expected_replica_count) {
+    if (!entry.exists ||
+        response.replicas.size() != entry.expected_replica_count) {
         return false;
     }
     if (entry.identity.checksum.has_value() &&
@@ -191,13 +201,11 @@ ReplicaSummary ShadowModel::Summarize(
     const mooncake::Replica::Descriptor& descriptor) {
     ReplicaSummary summary{descriptor.status, {}, {}, descriptor.id};
     if (descriptor.is_memory_replica()) {
-        summary.segment_endpoint =
-            descriptor.get_memory_descriptor().buffer_descriptor
-                .transport_endpoint_;
+        summary.segment_endpoint = descriptor.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
     } else if (descriptor.is_nof_replica()) {
-        summary.segment_endpoint =
-            descriptor.get_nof_descriptor().buffer_descriptor
-                .transport_endpoint_;
+        summary.segment_endpoint = descriptor.get_nof_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
     } else if (descriptor.is_local_disk_replica()) {
         summary.segment_endpoint =
             descriptor.get_local_disk_descriptor().transport_endpoint;
@@ -206,7 +214,7 @@ ReplicaSummary ShadowModel::Summarize(
 }
 
 bool ShadowModel::SameReplicaSummary(const ReplicaSummary& expected,
-                                    const ReplicaSummary& observed) {
+                                     const ReplicaSummary& observed) {
     return expected.status == observed.status &&
            (expected.segment_name.empty() ||
             expected.segment_name == observed.segment_name) &&

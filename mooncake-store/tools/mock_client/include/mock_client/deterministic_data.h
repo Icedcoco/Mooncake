@@ -28,16 +28,13 @@ uint64_t DeterministicSize(uint64_t seed, std::string_view namespace_name,
 
 // Return a deterministic metadata checksum over the fixed-width identity
 // inputs. This is a reproducibility token, not a payload integrity checksum.
-uint64_t DeterministicChecksum(uint64_t seed,
-                               std::string_view namespace_name,
+uint64_t DeterministicChecksum(uint64_t seed, std::string_view namespace_name,
                                uint32_t client_index, uint64_t object_index,
                                uint64_t generation, uint64_t logical_size);
 
 ObjectIdentity MakeObjectIdentity(uint64_t seed,
                                   std::string_view namespace_name,
-                                  uint32_t client_index,
-                                  uint64_t object_index,
-                                  uint64_t generation,
-                                  uint64_t logical_size);
+                                  uint32_t client_index, uint64_t object_index,
+                                  uint64_t generation, uint64_t logical_size);
 
 }  // namespace mock_client

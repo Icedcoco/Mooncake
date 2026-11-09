@@ -90,7 +90,8 @@ TEST(ShadowModelTest, ReconcileStoresOnlyNormalizedReplicaSummaries) {
     const auto* entry = model.Lookup(id.key);
     ASSERT_NE(entry, nullptr);
     ASSERT_EQ(entry->replicas.size(), 1);
-    EXPECT_EQ(entry->replicas.front().status, mooncake::ReplicaStatus::COMPLETE);
+    EXPECT_EQ(entry->replicas.front().status,
+              mooncake::ReplicaStatus::COMPLETE);
     EXPECT_EQ(entry->replicas.front().descriptor_id, 49);
     EXPECT_TRUE(entry->replicas.front().segment_name.empty());
     EXPECT_TRUE(entry->replicas.front().segment_endpoint.empty());

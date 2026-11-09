@@ -65,8 +65,8 @@ uint64_t ReadUnsigned(const Json::Value& parent, const std::string& key,
 uint32_t ReadUInt32(const Json::Value& parent, const std::string& key,
                     const std::string& context, uint32_t default_value,
                     bool require_positive = false) {
-    const uint64_t value = ReadUnsigned(parent, key, context, default_value,
-                                        require_positive);
+    const uint64_t value =
+        ReadUnsigned(parent, key, context, default_value, require_positive);
     if (value > std::numeric_limits<uint32_t>::max()) {
         Fail(context + " exceeds UINT32_MAX");
     }
@@ -105,14 +105,13 @@ BatchSizeRange ReadBatchRange(const Json::Value& value,
                               BatchSizeRange default_value) {
     if (!value.isMember("batch_size")) return default_value;
     const Json::Value& range = value["batch_size"];
-    if (!range.isObject() || !range.isMember("min") ||
-        !range.isMember("max")) {
+    if (!range.isObject() || !range.isMember("min") || !range.isMember("max")) {
         Fail(context + ".batch_size requires min and max");
     }
-    const uint32_t min = ReadUInt32(range, "min", context + ".batch_size.min",
-                                    0, true);
-    const uint32_t max = ReadUInt32(range, "max", context + ".batch_size.max",
-                                    0, true);
+    const uint32_t min =
+        ReadUInt32(range, "min", context + ".batch_size.min", 0, true);
+    const uint32_t max =
+        ReadUInt32(range, "max", context + ".batch_size.max", 0, true);
     if (min > max) Fail(context + ".batch_size.min cannot exceed max");
     return {min, max};
 }
@@ -129,14 +128,15 @@ void ParseClients(const Json::Value& root, MockClientConfig* config) {
     for (Json::ArrayIndex client_index = 0; client_index < clients.size();
          ++client_index) {
         const Json::Value& source = clients[client_index];
-        const std::string context = "clients[" + std::to_string(client_index) + "]";
+        const std::string context =
+            "clients[" + std::to_string(client_index) + "]";
         if (!source.isObject()) Fail(context + " must be an object");
 
         MockClientDefinition client;
         client.uuid = ReadString(source, "uuid", context + ".uuid");
         client.host_id = ReadString(source, "host_id", context + ".host_id");
-        client.seed_offset = ReadUnsigned(source, "seed_offset",
-                                          context + ".seed_offset", 0);
+        client.seed_offset =
+            ReadUnsigned(source, "seed_offset", context + ".seed_offset", 0);
         if (!client_uuids.insert(client.uuid).second) {
             Fail("duplicate client UUID: " + client.uuid);
         }
@@ -146,8 +146,8 @@ void ParseClients(const Json::Value& root, MockClientConfig* config) {
         if (!segments.isArray() || segments.empty()) {
             Fail(context + ".segments must be a non-empty array");
         }
-        for (Json::ArrayIndex segment_index = 0; segment_index < segments.size();
-             ++segment_index) {
+        for (Json::ArrayIndex segment_index = 0;
+             segment_index < segments.size(); ++segment_index) {
             const Json::Value& segment_source = segments[segment_index];
             const std::string segment_context =
                 context + ".segments[" + std::to_string(segment_index) + "]";
@@ -155,22 +155,24 @@ void ParseClients(const Json::Value& root, MockClientConfig* config) {
                 Fail(segment_context + " must be an object");
             }
             MockSegmentConfig segment;
-            segment.id = ReadString(segment_source, "id", segment_context + ".id");
+            segment.id =
+                ReadString(segment_source, "id", segment_context + ".id");
             segment.name =
                 ReadString(segment_source, "name", segment_context + ".name");
-            segment.capacity_bytes = ReadUnsigned(
-                segment_source, "capacity_bytes", segment_context + ".capacity_bytes",
-                0, true);
+            segment.capacity_bytes =
+                ReadUnsigned(segment_source, "capacity_bytes",
+                             segment_context + ".capacity_bytes", 0, true);
             segment.protocol = ReadString(segment_source, "protocol",
                                           segment_context + ".protocol");
-            segment.transport_endpoint = ReadString(
-                segment_source, "transport_endpoint",
-                segment_context + ".transport_endpoint");
-            segment.base_address = ReadUnsigned(
-                segment_source, "base_address", segment_context + ".base_address",
-                0, true);
-            segment.host_id = ReadString(segment_source, "host_id",
-                                         segment_context + ".host_id", client.host_id);
+            segment.transport_endpoint =
+                ReadString(segment_source, "transport_endpoint",
+                           segment_context + ".transport_endpoint");
+            segment.base_address =
+                ReadUnsigned(segment_source, "base_address",
+                             segment_context + ".base_address", 0, true);
+            segment.host_id =
+                ReadString(segment_source, "host_id",
+                           segment_context + ".host_id", client.host_id);
             if (!segment_names.insert(segment.name).second) {
                 Fail("duplicate segment name: " + segment.name);
             }
@@ -233,7 +235,8 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
     std::optional<std::string_view> operation_override) {
     std::ifstream input(path);
     if (!input) {
-        return tl::make_unexpected(ConfigError{"cannot open config file: " + path});
+        return tl::make_unexpected(
+            ConfigError{"cannot open config file: " + path});
     }
 
     Json::Value root;
@@ -245,7 +248,8 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
             ConfigError{"cannot parse config JSON: " + parse_errors});
     }
     if (!root.isObject()) {
-        return tl::make_unexpected(ConfigError{"config root must be an object"});
+        return tl::make_unexpected(
+            ConfigError{"config root must be an object"});
     }
 
     try {
@@ -253,7 +257,8 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
         const uint32_t schema_version =
             ReadUInt32(root, "schema_version", "schema_version", 0, true);
         if (schema_version != 1) {
-            Fail("unsupported schema_version: " + std::to_string(schema_version));
+            Fail("unsupported schema_version: " +
+                 std::to_string(schema_version));
         }
         config.schema_version = schema_version;
 
@@ -262,22 +267,21 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
         config.seed = ReadUnsigned(run, "seed", "run.seed", config.seed);
         config.namespace_name = ReadString(run, "namespace", "run.namespace",
                                            config.namespace_name);
-        config.duration_seconds = ReadUnsigned(
-            run, "duration_seconds", "run.duration_seconds",
-            config.duration_seconds, true);
+        config.duration_seconds =
+            ReadUnsigned(run, "duration_seconds", "run.duration_seconds",
+                         config.duration_seconds, true);
 
         const Json::Value master = RequireObject(root, "master", "master");
         config.master_endpoints =
             ReadStringList(master, "endpoints", "master.endpoints", true);
-        config.metrics_endpoints =
-            ReadStringList(master, "metrics_endpoints", "master.metrics_endpoints",
-                           false);
-        config.request_timeout_ms = ReadUInt32(
-            master, "request_timeout_ms", "master.request_timeout_ms",
-            config.request_timeout_ms, true);
-        config.scrape_interval_ms = ReadUInt32(
-            master, "scrape_interval_ms", "master.scrape_interval_ms",
-            config.scrape_interval_ms, true);
+        config.metrics_endpoints = ReadStringList(
+            master, "metrics_endpoints", "master.metrics_endpoints", false);
+        config.request_timeout_ms = ReadUInt32(master, "request_timeout_ms",
+                                               "master.request_timeout_ms",
+                                               config.request_timeout_ms, true);
+        config.scrape_interval_ms = ReadUInt32(master, "scrape_interval_ms",
+                                               "master.scrape_interval_ms",
+                                               config.scrape_interval_ms, true);
 
         ParseClients(root, &config);
         ParseReplication(root, &config);
@@ -293,9 +297,9 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
             config.workload_profile != "adaptive") {
             Fail("workload.profile must be low, medium, full, or adaptive");
         }
-        config.target_logical_ops_per_second = ReadUnsigned(
-            workload, "target_logical_ops_per_second",
-            "workload.target_logical_ops_per_second", 0);
+        config.target_logical_ops_per_second =
+            ReadUnsigned(workload, "target_logical_ops_per_second",
+                         "workload.target_logical_ops_per_second", 0);
         config.concurrency = ReadUInt32(workload, "concurrency",
                                         "workload.concurrency", 1, true);
         config.batch_size = ReadBatchRange(workload, "workload", {1, 1});
@@ -304,7 +308,8 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
         if (!operations) return tl::make_unexpected(operations.error());
         config.operations = std::move(*operations);
         if (operation_override.has_value()) {
-            auto override_operations = ParseOperationOverride(*operation_override);
+            auto override_operations =
+                ParseOperationOverride(*operation_override);
             if (!override_operations) {
                 return tl::make_unexpected(override_operations.error());
             }
@@ -325,7 +330,8 @@ tl::expected<MockClientConfig, ConfigError> MockClientConfig::LoadFile(
 
         const Json::Value report = RequireObject(root, "report", "report");
         config.report_settings = report;
-        config.jsonl_path = ReadString(report, "jsonl_path", "report.jsonl_path");
+        config.jsonl_path =
+            ReadString(report, "jsonl_path", "report.jsonl_path");
         config.raw_metrics_path =
             ReadString(report, "raw_metrics_path", "report.raw_metrics_path");
         config.summary_path =

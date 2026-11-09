@@ -21,7 +21,7 @@ TEST(DeterministicDataTest, SameInputsProduceSameIdentityFields) {
 
 TEST(DeterministicDataTest, GenerationContributesToChecksum) {
     EXPECT_NE(DeterministicChecksum(23, "tenant/a", 3, 17, 1, 4096),
-             DeterministicChecksum(23, "tenant/a", 3, 17, 2, 4096));
+              DeterministicChecksum(23, "tenant/a", 3, 17, 2, 4096));
 }
 
 TEST(DeterministicDataTest, NamespaceIsEncodedInKeyPrefix) {

@@ -63,7 +63,7 @@ endif()
 add_subdirectory(src)
 
 if(BUILD_MOCK_CLIENT)
-    add_subdirectory(tools/mock_client)
+  add_subdirectory(tools/mock_client)
 endif()
 
 if (STORE_USE_ETCD)

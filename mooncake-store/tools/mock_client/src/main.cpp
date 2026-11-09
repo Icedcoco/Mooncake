@@ -12,7 +12,8 @@ DEFINE_string(operations, "",
 
 int main(int argc, char** argv) {
     gflags::SetUsageMessage(
-        "Validate a mock-client config: mooncake_master_mock_client --config=FILE");
+        "Validate a mock-client config: mooncake_master_mock_client "
+        "--config=FILE");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (FLAGS_config.empty()) {
         std::cerr << "--config is required\n";

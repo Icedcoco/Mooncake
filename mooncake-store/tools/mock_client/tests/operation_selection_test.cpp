@@ -13,8 +13,8 @@ Json::Value Operation(const char* name, const char* form, Json::UInt weight) {
     return value;
 }
 
-Json::Value BatchOperation(const char* name, Json::UInt weight,
-                           Json::UInt min, Json::UInt max) {
+Json::Value BatchOperation(const char* name, Json::UInt weight, Json::UInt min,
+                           Json::UInt max) {
     Json::Value value = Operation(name, "batch", weight);
     value["batch_size"]["min"] = min;
     value["batch_size"]["max"] = max;
@@ -70,8 +70,8 @@ TEST(OperationSelectionTest, PreservesMixedSelectionOrderAndStableNames) {
 }
 
 TEST(OperationSelectionTest, ParsesMixedSingleAndBatchOverride) {
-    auto result = ParseOperationOverride(
-        "put:single=3,put:batch=2,remove:single=1");
+    auto result =
+        ParseOperationOverride("put:single=3,put:batch=2,remove:single=1");
 
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 3);
@@ -84,8 +84,8 @@ TEST(OperationSelectionTest, ParsesMixedSingleAndBatchOverride) {
 }
 
 TEST(OperationSelectionTest, RejectsEmptySelection) {
-    EXPECT_FALSE(ParseOperationSelection(Json::Value(Json::arrayValue))
-                     .has_value());
+    EXPECT_FALSE(
+        ParseOperationSelection(Json::Value(Json::arrayValue)).has_value());
     EXPECT_FALSE(ParseOperationOverride("").has_value());
 }
 

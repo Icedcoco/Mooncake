@@ -9,7 +9,9 @@
 namespace mock_client {
 namespace {
 
-ConfigError Error(std::string message) { return ConfigError{std::move(message)}; }
+ConfigError Error(std::string message) {
+    return ConfigError{std::move(message)};
+}
 
 std::string_view Trim(std::string_view value) {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -56,8 +58,8 @@ tl::expected<LogicalOperation, ConfigError> ParseOperationName(
     if (name == "upsert") return LogicalOperation::Upsert;
     if (name == "get") return LogicalOperation::Get;
     if (name == "remove") return LogicalOperation::Remove;
-    return tl::make_unexpected(Error("unknown operation name: " +
-                                     std::string(name)));
+    return tl::make_unexpected(
+        Error("unknown operation name: " + std::string(name)));
 }
 
 tl::expected<OperationForm, ConfigError> ParseForm(std::string_view form) {
@@ -76,8 +78,8 @@ tl::expected<OperationSelection, ConfigError> ParseOverrideEntry(
         colon == 0 || equals <= colon + 1 || equals + 1 >= entry.size() ||
         entry.find(':', colon + 1) != std::string_view::npos ||
         entry.find('=', equals + 1) != std::string_view::npos) {
-        return tl::make_unexpected(Error(
-            "operation override entry must use operation:form=weight"));
+        return tl::make_unexpected(
+            Error("operation override entry must use operation:form=weight"));
     }
 
     auto operation = ParseOperationName(Trim(entry.substr(0, colon)));
@@ -86,7 +88,8 @@ tl::expected<OperationSelection, ConfigError> ParseOverrideEntry(
     if (!form) return tl::make_unexpected(form.error());
     uint32_t weight = 0;
     if (!ParseWeight(Trim(entry.substr(equals + 1)), &weight)) {
-        return tl::make_unexpected(Error("operation weight must be a positive uint32"));
+        return tl::make_unexpected(
+            Error("operation weight must be a positive uint32"));
     }
     return OperationSelection{*operation, *form, weight, {1, 1}};
 }
@@ -161,13 +164,14 @@ ParseOperationSelection(const Json::Value& value) {
             if (!batch.isObject() || !batch.isMember("min") ||
                 !batch.isMember("max")) {
                 return tl::make_unexpected(
-                    Error("batch operation requires batch_size.min and batch_size.max"));
+                    Error("batch operation requires batch_size.min and "
+                          "batch_size.max"));
             }
             if (!ReadPositiveUInt32(batch["min"], &batch_size.min) ||
                 !ReadPositiveUInt32(batch["max"], &batch_size.max) ||
                 batch_size.min > batch_size.max) {
-                return tl::make_unexpected(
-                    Error("batch_size must satisfy 0 < min <= max <= UINT32_MAX"));
+                return tl::make_unexpected(Error(
+                    "batch_size must satisfy 0 < min <= max <= UINT32_MAX"));
             }
         }
         selections.push_back(
@@ -180,7 +184,8 @@ tl::expected<std::vector<OperationSelection>, ConfigError>
 ParseOperationOverride(std::string_view value) {
     value = Trim(value);
     if (value.empty()) {
-        return tl::make_unexpected(Error("operation selection cannot be empty"));
+        return tl::make_unexpected(
+            Error("operation selection cannot be empty"));
     }
 
     std::vector<OperationSelection> selections;
