@@ -176,6 +176,30 @@ TEST(MasterServiceConfigTest, StandbyPollPageSizeDefaultsAndPropagates) {
     EXPECT_EQ(64u, built.oplog_standby_max_batches_per_poll);
 }
 
+TEST(MasterServiceConfigTest, OpLogPruningDefaultsPropagateToSupervisor) {
+    MasterConfig master_config{};
+    EXPECT_EQ(10u, master_config.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, master_config.oplog_prune_max_batches_per_second);
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(10u, supervisor_config.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, supervisor_config.oplog_prune_max_batches_per_second);
+
+    WrappedMasterServiceConfig wrapped(supervisor_config, 1);
+    MasterServiceConfig service_config(wrapped);
+    EXPECT_EQ(10u, wrapped.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, wrapped.oplog_prune_max_batches_per_second);
+    EXPECT_EQ(10u, service_config.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(50u, service_config.oplog_prune_max_batches_per_second);
+
+    const auto built = MasterServiceConfig::builder()
+                           .set_oplog_prune_chunk_batch_count(7)
+                           .set_oplog_prune_max_batches_per_second(19)
+                           .build();
+    EXPECT_EQ(7u, built.oplog_prune_chunk_batch_count);
+    EXPECT_EQ(19u, built.oplog_prune_max_batches_per_second);
+}
+
 TEST(MasterServiceConfigTest, OplogIsDisabledByDefault) {
     MasterConfig master_config;
     EXPECT_FALSE(master_config.enable_oplog);
@@ -242,6 +266,12 @@ TEST(MasterServiceConfigTest, ValidatesOplogSnapshotConfiguration) {
     config.snapshot_chunk_object_count = 0;
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
     config.snapshot_chunk_object_count = 1;
+    config.oplog_prune_chunk_batch_count = 0;
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.oplog_prune_chunk_batch_count = 10;
+    config.oplog_prune_max_batches_per_second = 0;
+    EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
+    config.oplog_prune_max_batches_per_second = 50;
     config.snapshot_object_store_type.clear();
     EXPECT_TRUE(ValidateBatchOpLogSnapshotConfig(config).has_value());
 }
