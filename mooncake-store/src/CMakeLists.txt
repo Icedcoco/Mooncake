@@ -603,6 +603,12 @@ target_link_libraries(
           OpenSSL::Crypto
           asio_shared
           yalantinglibs::yalantinglibs)
+if(HAVE_AWS_SDK)
+  # Object sources need the SDK's include paths before the final static library
+  # links against the SDK, especially for non-system SDK installations.
+  target_link_libraries(mooncake_store_master_objects
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
