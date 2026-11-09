@@ -29,8 +29,7 @@ EtcdHelper::TxnCompareKind ToEtcdCompareKind(KvCompareKind kind) {
 }
 
 ErrorCode ReadRange(std::string_view begin_key, std::string_view end_key,
-                    size_t limit, std::vector<KvPair>& kvs,
-                    bool serializable) {
+                    size_t limit, std::vector<KvPair>& kvs, bool serializable) {
     kvs.clear();
     std::string json;
     EtcdRevisionId revision_id = 0;
@@ -80,9 +79,10 @@ ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
     return ReadRange(begin_key, end_key, limit, kvs, false);
 }
 
-ErrorCode EtcdHaKvBackend::RangeSerializable(
-    std::string_view begin_key, std::string_view end_key, size_t limit,
-    std::vector<KvPair>& kvs) {
+ErrorCode EtcdHaKvBackend::RangeSerializable(std::string_view begin_key,
+                                             std::string_view end_key,
+                                             size_t limit,
+                                             std::vector<KvPair>& kvs) {
     return ReadRange(begin_key, end_key, limit, kvs, true);
 }
 
