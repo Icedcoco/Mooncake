@@ -86,6 +86,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             SetPollError(result, err, IsRetryableBackendError(err));
         }
     }
+    result.has_more_pages =
+        max_batches != 0 && result.applied_batches >= max_batches &&
+        result.durable_prefix_present &&
+        last_applied_batch_id_ < result.durable_prefix.batch_id;
     return result;
 }
 
@@ -141,19 +145,14 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
         return result;
     }
 
-    TestFailPoint::Wait("standby_prefix_read_before_batch");
-    OpLogBatchRecord target_batch;
-    err = storage_.ReadBatch(prefix.batch_id, target_batch);
-    if (err != ErrorCode::OK) {
-        SetPollError(result, err, IsRetryableBackendError(err));
-        return result;
-    }
-    if (target_batch.last_seq != prefix.last_seq) {
-        SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
-        return result;
-    }
     last_observed_prefix_ = prefix;
     if (prefix.batch_id <= last_applied_batch_id_) {
+        TestFailPoint::Wait("standby_prefix_read_before_batch");
+        if (prefix.batch_id != last_applied_batch_id_ ||
+            last_scanned_batch_last_seq_ != prefix.last_seq) {
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
+            return result;
+        }
         const uint64_t expected = applier_.GetExpectedSequenceId();
         if (prefix.batch_id == last_applied_batch_id_ &&
             last_scanned_batch_last_seq_ == prefix.last_seq && expected > 0 &&
@@ -164,18 +163,31 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
     }
 
     std::vector<OpLogBatchRecord> batches;
-    err =
-        storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches, batches);
+    TestFailPoint::Wait("standby_prefix_read_before_batch");
+    err = storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches,
+                                    batches, /*serializable=*/true);
     if (err != ErrorCode::OK) {
         SetPollError(result, err, IsRetryableBackendError(err));
         return result;
     }
     for (const auto& batch : batches) {
+        if (batch.batch_id > prefix.batch_id) {
+            break;
+        }
+        if (batch.last_seq > prefix.last_seq) {
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
+            return result;
+        }
         if (last_applied_batch_id_ == UINT64_MAX ||
             (last_applied_batch_id_ != 0 &&
              batch.batch_id != last_applied_batch_id_ + 1) ||
             (last_applied_batch_id_ == 0 && require_complete_history_ &&
              batch.batch_id != 1)) {
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
+            return result;
+        }
+        if (batch.batch_id == prefix.batch_id &&
+            batch.last_seq != prefix.last_seq) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
@@ -215,18 +227,28 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
         ++result.applied_batches;
         last_applied_batch_id_ = batch.batch_id;
         last_scanned_batch_last_seq_ = batch.last_seq;
+        last_applied_durable_prefix_ = {
+            .batch_id = batch.batch_id,
+            .last_seq = batch.last_seq,
+        };
         if (last_applied_batch_id_ >= prefix.batch_id) {
             break;
         }
     }
-    const bool has_more_pages = max_batches != 0 &&
-                                batches.size() >= max_batches &&
-                                last_applied_batch_id_ < prefix.batch_id;
-    if (!has_more_pages &&
+    result.has_more_pages = max_batches != 0 && batches.size() >= max_batches &&
+                            last_applied_batch_id_ < prefix.batch_id;
+    if (!result.has_more_pages && last_applied_batch_id_ < prefix.batch_id) {
+        // A local serializable Range may trail the linearizable durable prefix.
+        // Keep the cursor at the last contiguous batch and wait for a later
+        // poll to observe the immutable suffix; never skip a batch or fail HA.
+        return result;
+    }
+    if (!result.has_more_pages &&
         IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
                                prefix.last_seq)) {
         SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
-    } else if (!has_more_pages && last_applied_batch_id_ == prefix.batch_id &&
+    } else if (!result.has_more_pages &&
+               last_applied_batch_id_ == prefix.batch_id &&
                last_scanned_batch_last_seq_ == prefix.last_seq) {
         const uint64_t expected = applier_.GetExpectedSequenceId();
         if (expected > 0 && expected - 1 == prefix.last_seq) {
