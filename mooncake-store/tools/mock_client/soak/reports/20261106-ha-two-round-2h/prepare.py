@@ -211,7 +211,7 @@ raise SystemExit(rc)
             f"""from pathlib import Path
 import shutil,json,subprocess,hashlib
 b=Path({BUILD!r}); d=Path({REMOTE!r})
-files={{'bin/mooncake_master':b/'mooncake-store/src/mooncake_master','bin/comparison-pressure':b/'mooncake-store/tools/mock_client/mooncake_durable_pressure','bin/mooncake_master_mock_client':b/'mooncake-store/tools/mock_client/mooncake_master_mock_client','lib/libetcd_wrapper.so':b/'mooncake-common/etcd/libetcd_wrapper.so','lib/libasio.so':b/'mooncake-common/src/libasio.so'}}
+files={{'bin/mooncake_master':b/'mooncake-store/src/mooncake_master','bin/comparison-pressure':b/'mooncake-store/tools/mock_client/mooncake_durable_pressure','bin/mooncake_master_mock_client':b/'mooncake-store/tools/mock_client/mooncake_master_mock_client','lib/libetcd_wrapper.so':b/'mooncake-common/etcd/libetcd_wrapper.so','lib/libasio.so':b/'mooncake-common/libasio.so'}}
 for dst,src in files.items(): shutil.copy2(src,d/dst)
 manifest={{'source_commit':{commit!r},'source_archive_sha256':{source_sha!r},'build_host':'madsys-01','yalantinglibs_commit':{dependency_commit!r},'yalantinglibs_archive_sha256':{dependency_sha!r},'files':{{dst:hashlib.sha256((d/dst).read_bytes()).hexdigest() for dst in files}},'go_version':subprocess.check_output([{GO!r}+'/go','version'],text=True),'compiler':subprocess.check_output(['g++','--version'],text=True).splitlines()[0]}}
 (d/'build-manifest.json').write_text(json.dumps(manifest,indent=2))
