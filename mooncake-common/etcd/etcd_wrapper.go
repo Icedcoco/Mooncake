@@ -38,6 +38,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -924,6 +925,61 @@ func hasKeepAliveContext(leaseId int64) bool {
 	return exists
 }
 
+// classifyKeepAliveTTLProbe converts the result of a best-effort lease probe
+// into a stable diagnostic label.  It is deliberately separate from the
+// keep-alive failure path: a probe must never decide whether HA remains
+// fenced.
+func classifyKeepAliveTTLProbe(ttl int64, err error) string {
+	if err == nil && ttl > 0 {
+		return "lease_alive"
+	}
+	if errors.Is(err, rpctypes.ErrLeaseNotFound) || err == nil && ttl <= 0 {
+		return "lease_not_found"
+	}
+	return "probe_error"
+}
+
+func formatKeepAliveCloseDiagnostic(leaseID int64, ctxErr error,
+	responses, lastTTL int64, lastResponseAge time.Duration) string {
+	reason := "channel_closed_without_cancel"
+	if ctxErr != nil {
+		reason = "context_cancelled"
+	}
+	ageMS := int64(-1)
+	if lastResponseAge >= 0 {
+		ageMS = lastResponseAge.Milliseconds()
+	}
+	return fmt.Sprintf(
+		"keep alive channel closed: lease_id=%d reason=%s context_error=%v responses=%d last_ttl_seconds=%d last_response_age_ms=%d",
+		leaseID, reason, ctxErr, responses, lastTTL, ageMS)
+}
+
+func probeKeepAliveTTL(endpoints []string, leaseID int64) {
+	started := time.Now()
+	clientConfig, err := newStoreClientConfig(endpoints)
+	if err != nil {
+		log.Printf("keep alive TTL probe: lease_id=%d classification=probe_error elapsed_ms=%d error=%v",
+			leaseID, time.Since(started).Milliseconds(), err)
+		return
+	}
+	cli, err := clientv3.New(clientConfig)
+	if err != nil {
+		log.Printf("keep alive TTL probe: lease_id=%d classification=probe_error elapsed_ms=%d error=%v",
+			leaseID, time.Since(started).Milliseconds(), err)
+		return
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := cli.TimeToLive(ctx, clientv3.LeaseID(leaseID))
+	ttl := int64(0)
+	if resp != nil {
+		ttl = resp.TTL
+	}
+	log.Printf("keep alive TTL probe: lease_id=%d classification=%s ttl_seconds=%d elapsed_ms=%d error=%v",
+		leaseID, classifyKeepAliveTTLProbe(ttl, err), ttl, time.Since(started).Milliseconds(), err)
+}
+
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	storeCli := getStoreClient()
@@ -943,6 +999,9 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
+	endpoints := storeCli.Endpoints()
+	var responseCount, lastTTL int64
+	lastResponseAt := time.Time{}
 	defer cli.Close()
 
 	// Create a context with cancel function
@@ -972,20 +1031,40 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		select {
 		case resp, ok := <-keepAliveChan:
 			if !ok {
-				*errMsg = C.CString("keep alive channel closed")
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					*errMsg = C.CString(formatKeepAliveCloseDiagnostic(leaseId, ctxErr,
+						responseCount, lastTTL, responseAge(lastResponseAt)))
+					return -2
+				}
+				*errMsg = C.CString(formatKeepAliveCloseDiagnostic(leaseId, nil,
+					responseCount, lastTTL, responseAge(lastResponseAt)))
+				go probeKeepAliveTTL(endpoints, leaseId)
 				return -1
 			}
 			if resp == nil {
-				*errMsg = C.CString("keep alive response is nil")
+				*errMsg = C.CString(fmt.Sprintf(
+					"keep alive response is nil: lease_id=%d responses=%d last_ttl_seconds=%d last_response_age_ms=%d",
+					leaseId, responseCount, lastTTL, responseAge(lastResponseAt).Milliseconds()))
 				return -1
 			}
 			// Keep alive successful, continue
+			responseCount++
+			lastTTL = resp.TTL
+			lastResponseAt = time.Now()
 		case <-ctx.Done():
 			// Context cancelled
-			*errMsg = C.CString("keep alive context cancelled")
+			*errMsg = C.CString(formatKeepAliveCloseDiagnostic(leaseId, ctx.Err(),
+				responseCount, lastTTL, responseAge(lastResponseAt)))
 			return -2
 		}
 	}
+}
+
+func responseAge(lastResponseAt time.Time) time.Duration {
+	if lastResponseAt.IsZero() {
+		return -1
+	}
+	return time.Since(lastResponseAt)
 }
 
 //export EtcdStoreCancelKeepAliveWrapper
