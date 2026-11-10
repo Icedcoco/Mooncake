@@ -282,6 +282,7 @@ print(json.dumps({'time':__import__('time').time(),'free_bytes':shutil.disk_usag
             "hold_seconds": 180,
             "workload": workload,
             "live_target_keys": 65536,
+            "get_batches_per_put": 2 if workload == "put_evict_get" else 0,
         }
         save(dest / "client-config.json", config)
         subprocess.run(
@@ -366,6 +367,8 @@ print(json.dumps({'time':__import__('time').time(),'free_bytes':shutil.disk_usag
                     c.get("success"),
                     "remove",
                     c.get("remove_success"),
+                    "get",
+                    c.get("get_success"),
                     "durable",
                     summary["nodes"].get("madsys-02", {}).get("durable_seq"),
                     flush=True,
@@ -517,7 +520,7 @@ def main():
         "--workloads",
         nargs="+",
         default=["put_evict", "put_remove"],
-        choices=["put_evict", "put_remove"],
+        choices=["put_evict", "put_remove", "put_evict_get"],
     )
     args = p.parse_args()
     assert args.seconds > 0

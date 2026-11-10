@@ -1,10 +1,42 @@
 """防止类型颠倒、收尾混入供压窗口、累计删除重复求和及序号缺口。"""
 
 import unittest
-from statistics_report import audit_minutes, parse_metrics, histogram_delta
+from statistics_report import (
+    audit_minutes,
+    parse_metrics,
+    histogram_delta,
+    get_reconciliation,
+)
 
 
 class StatisticsTests(unittest.TestCase):
+    def test_get_ratio_counts_attempts_and_reconciles_master(self):
+        result = get_reconciliation(
+            dict(
+                attempted=128,
+                success=120,
+                get_attempted=256,
+                get_success=240,
+                missing=16,
+                get_errors=0,
+                get_batches=2,
+            ),
+            {
+                "master_batch_get_replica_list_items_total": 256,
+                "master_batch_get_replica_list_failed_items_total": 16,
+                "master_batch_get_replica_list_requests_total": 2,
+            },
+        )
+        self.assertEqual(result["get_to_put_attempt_ratio"], 2)
+        self.assertEqual(result["get_outcome_difference"], 0)
+        self.assertEqual(result["master_client_get_difference"], 0)
+        self.assertEqual(result["master_get_success"], 240)
+
+    def test_missing_master_get_metrics_are_not_reported_as_zero(self):
+        result = get_reconciliation(dict(attempted=1, get_attempted=2), {})
+        self.assertIsNone(result["master_get_items"])
+        self.assertIsNone(result["master_client_get_difference"])
+
     def test_types_minute_boundaries_and_tail_are_separate(self):
         rows = [
             dict(

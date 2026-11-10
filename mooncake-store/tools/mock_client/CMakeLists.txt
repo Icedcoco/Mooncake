@@ -49,4 +49,8 @@ if(BUILD_UNIT_TESTS)
   target_compile_options(mock_client_live_window_test PRIVATE -UNDEBUG)
   add_test(NAME mock_client_live_window_test
            COMMAND mock_client_live_window_test)
+  add_executable(mock_client_read_plan_test
+                 soak/reports/20261106-ha-two-round-2h/read_plan_test.cpp)
+  target_compile_options(mock_client_read_plan_test PRIVATE -UNDEBUG)
+  add_test(NAME mock_client_read_plan_test COMMAND mock_client_read_plan_test)
 endif()

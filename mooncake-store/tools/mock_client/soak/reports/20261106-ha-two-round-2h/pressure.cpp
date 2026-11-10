@@ -1,4 +1,5 @@
 #include "mock_client/master_api.h"
+#include "read_plan.h"
 #include "window.h"
 #include <atomic>
 #include <chrono>
@@ -27,7 +28,8 @@ struct Counters {
         end_errors{0}, verified{0}, missing{0}, mismatch{0}, unknown{0},
         batches{0}, start_us{0}, end_us{0}, get_us{0}, backoff_ms{0},
         remove_attempted{0}, remove_success{0}, remove_errors{0}, remove_us{0},
-        live_keys{0};
+        live_keys{0}, get_attempted{0}, get_success{0}, get_errors{0},
+        get_batches{0}, get_after_failed_put{0};
 };
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -48,8 +50,18 @@ int main(int argc, char** argv) {
     if (!workers || workers > 64 || !batch || batch > 128 || !seconds ||
         !every || capacity % 4096 || !size)
         return 2;
-    const bool mixed =
-        c.get("workload", "put_evict").asString() == "put_remove";
+    const auto workload = c.get("workload", "put_evict").asString();
+    if (workload != "put_evict" && workload != "put_remove" &&
+        workload != "put_evict_get")
+        return 2;
+    const bool mixed = workload == "put_remove";
+    const unsigned get_batches_per_put =
+        c.get("get_batches_per_put", workload == "put_evict_get" ? 2 : 0)
+            .asUInt();
+    if ((workload == "put_evict_get" &&
+         (!get_batches_per_put || get_batches_per_put > 64)) ||
+        (workload != "put_evict_get" && get_batches_per_put))
+        return 2;
     const uint64_t live_target = c.get("live_target_keys", 65536).asUInt64();
     if (mixed && (live_target < workers * batch ||
                   (live_target + workers * batch) * size > capacity / 2))
@@ -176,6 +188,7 @@ int main(int argc, char** argv) {
                 }
                 std::vector<ObjectMeta> metas;
                 std::vector<size_t> indices;
+                std::vector<bool> put_success(batch, false);
                 bool backpressure = false;
                 for (size_t i = 0; i < starts.size(); ++i) {
                     if (!starts[i]) {
@@ -189,10 +202,12 @@ int main(int argc, char** argv) {
                         !valid(starts[i]->front(), false)) {
                         ++n.mismatch;
                         stopped = true;
+                        break;
                     }
                     metas.push_back({keys[i], uint64_t(0x12340000 + w)});
                     indices.push_back(i);
                 }
+                if (n.unknown || n.mismatch) break;
                 if (!metas.empty()) {
                     tick = Clock::now();
                     auto ends = api.BatchPutEnd(metas);
@@ -205,18 +220,13 @@ int main(int argc, char** argv) {
                         stopped = true;
                         break;
                     }
-                    std::vector<std::string> check;
-                    std::vector<size_t> checked;
                     for (size_t j = 0; j < ends.size(); ++j)
                         if (ends[j]) {
                             ++n.success;
+                            put_success[indices[j]] = true;
                             if (mixed) {
                                 live.Add(metas[j].key);
                                 ++n.live_keys;
-                            }
-                            if (nb % every == 0) {
-                                check.push_back(metas[j].key);
-                                checked.push_back(indices[j]);
                             }
                         } else {
                             ++n.end_errors;
@@ -225,7 +235,18 @@ int main(int argc, char** argv) {
                                 stopped = true;
                             backpressure = true;
                         }
-                    if (!check.empty()) {
+                }
+                if (n.unknown || n.mismatch) break;
+                const auto plan =
+                    PlanReads(get_batches_per_put, nb, every, put_success);
+                std::vector<std::string> check;
+                for (auto i : plan.indices) check.push_back(keys[i]);
+                if (!check.empty()) {
+                    for (unsigned round = 0; round < plan.rounds; ++round) {
+                        n.get_attempted += check.size();
+                        ++n.get_batches;
+                        for (auto i : plan.indices)
+                            if (!put_success[i]) ++n.get_after_failed_put;
                         tick = Clock::now();
                         auto gets = api.BatchGetReplicaList(check);
                         n.get_us +=
@@ -243,13 +264,23 @@ int main(int argc, char** argv) {
                                     ErrorCode::OBJECT_NOT_FOUND)
                                     ++n.missing;
                                 else {
+                                    ++n.get_errors;
                                     error("get", gets[j].error());
-                                    stopped = true;
+                                    if (IsTransportError(gets[j].error()) ||
+                                        put_success[plan.indices[j]])
+                                        stopped = true;
                                 }
                                 continue;
                             }
+                            ++n.get_success;
                             auto& g = *gets[j];
-                            auto& old = starts[checked[j]]->front();
+                            const auto& original = starts[plan.indices[j]];
+                            if (!original || original->size() != 1) {
+                                ++n.mismatch;
+                                stopped = true;
+                                continue;
+                            }
+                            auto& old = original->front();
                             bool match =
                                 g.object_checksum ==
                                     std::optional<uint64_t>(0x12340000 + w) &&
@@ -271,6 +302,7 @@ int main(int argc, char** argv) {
                                 stopped = true;
                             }
                         }
+                        if (n.unknown || n.mismatch) break;
                     }
                 }
                 ++nb;
@@ -307,6 +339,11 @@ int main(int argc, char** argv) {
         COUNT(start_us);
         COUNT(end_us);
         COUNT(get_us);
+        COUNT(get_attempted);
+        COUNT(get_success);
+        COUNT(get_errors);
+        COUNT(get_batches);
+        COUNT(get_after_failed_put);
         COUNT(backoff_ms);
         COUNT(remove_attempted);
         COUNT(remove_success);

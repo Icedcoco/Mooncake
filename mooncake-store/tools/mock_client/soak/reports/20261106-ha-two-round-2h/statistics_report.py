@@ -58,6 +58,31 @@ def counter_delta(before, after, key):
     return value if value >= 0 else None
 
 
+def get_reconciliation(done, master):
+    """Get 不进入 durable；按逻辑对象尝试数核对比例和服务端收尾计数。"""
+    attempted = done.get("get_attempted", 0)
+    items = master.get("master_batch_get_replica_list_items_total")
+    failed = master.get("master_batch_get_replica_list_failed_items_total")
+    return {
+        "get_to_put_attempt_ratio": attempted / done["attempted"]
+        if done.get("attempted")
+        else None,
+        "get_outcome_difference": attempted
+        - sum(done.get(k, 0) for k in ["get_success", "missing", "get_errors"]),
+        "master_get_items": items,
+        "master_get_failed_items": failed,
+        "master_get_success": items - failed
+        if items is not None and failed is not None
+        else None,
+        "master_get_requests": master.get(
+            "master_batch_get_replica_list_requests_total"
+        ),
+        "master_client_get_difference": items - attempted
+        if items is not None
+        else None,
+    }
+
+
 def audit_minutes(rows, start, seconds):
     minutes = [
         dict(
@@ -198,6 +223,9 @@ def node_minutes(path, start, seconds):
             "master_evicted_key_count",
             "master_batch_put_end_items_total",
             "master_batch_put_end_failed_items_total",
+            "master_batch_get_replica_list_items_total",
+            "master_batch_get_replica_list_failed_items_total",
+            "master_batch_get_replica_list_requests_total",
             "ha_batch_record_durable_entries_total",
             "ha_batch_record_retry_total",
             "ha_oplog_checksum_failures_total",
@@ -393,6 +421,12 @@ def generate(root):
             "mismatch",
             "unknown",
             "missing",
+            "get_attempted",
+            "get_success",
+            "get_errors",
+            "get_batches",
+            "get_after_failed_put",
+            "get_us",
         ]:
             m["client_" + key] = current.get(key, 0) - prev.get(key, 0)
         m["client_live_keys_last"] = current.get("live_keys", 0)
@@ -408,6 +442,15 @@ def generate(root):
         client=done,
         client_rc=run.get("client_rc"),
     )
+    # 收尾采样包含最后完成的RPC；每分钟采样仍按供压窗口裁剪。
+    final_master = {}
+    for row in jsonlines(root / "madsys-02/monitor.jsonl.gz"):
+        metrics = row.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = parse_metrics(metrics)
+        if "master_batch_get_replica_list_items_total" in metrics:
+            final_master = metrics
+    summary.update(get_reconciliation(done, final_master))
     summary["window_put_end"] = sum(m["durable_put_end"] for m in minutes)
     summary["window_remove"] = sum(m["durable_remove"] for m in minutes)
     summary["window_batches"] = sum(m["durable_batches"] for m in minutes)
@@ -433,6 +476,19 @@ def generate(root):
             - total["all_put_end"]
         )
     warnings = []
+    if run["workload"] == "put_evict_get" and (
+        summary["get_to_put_attempt_ratio"] != 2
+        or summary["get_outcome_difference"] != 0
+        or summary["master_client_get_difference"] != 0
+    ):
+        warnings.append(
+            (
+                "混合读写比例或Get计数未对齐",
+                "测试工具/Store",
+                json.dumps(get_reconciliation(done, final_master), ensure_ascii=False),
+                "检查提前停止、未完成RPC及最终master采样，不能用client计数替代master实际处理数。",
+            )
+        )
     if actual < target - 1 or run.get("client_rc") != 0:
         warnings.append(
             (
@@ -590,14 +646,36 @@ client 成功回调={done.get('success')}，Remove成功={done.get('remove_succe
 HA-002的callback/durable差异作为既定语义记录，不改生产代码掩盖差异。
 最终日志记录的 PutEnd 入队失败={summary['putend_queue_rejected']}；callback 减入队失败再减完整 durable PUT_END 的剩余差异={summary.get('callback_reconciliation_difference')}。
 
-配置：2 workers，client batch=128，1KiB对象，单副本，256MiB模拟segment；正式long02的run_id前缀固定82字节，与之前r10m3长度一致；put_remove保留65536个成功key的存量窗口，先删除再补入；HA+OpLog+Snapshot开启，master=madsys-02，standby=madsys-01/03，RPC线程16，OpLog batch上限8192，standby每次最多读取16 batch，prune chunk=10/max=50 batch/s，Snapshot间隔60s/chunk100000，offload_on_evict=false。etcd三节点3.5.33、periodic保留5m、compaction limit=8/sleep=100ms、backend interval=100ms/limit10000、snapshot-count1000、quota24GiB/maxrequest8MiB。
-二进制来源及SHA256见 build-manifest.json，逐节点实际启动命令见 deployment.json；两轮复用相同二进制，每轮使用新的专用etcd数据与cluster id。
+配置：2 workers，client batch=128，1KiB对象，单副本，256MiB模拟segment；run_id前缀固定82字节，与之前r10m3长度一致；put_remove保留65536个成功key的存量窗口，先删除再补入；HA+OpLog+Snapshot开启，master=madsys-02，standby=madsys-01/03，RPC线程16，OpLog batch上限8192，standby每次最多读取16 batch，prune chunk=10/max=50 batch/s，Snapshot间隔60s/chunk100000，offload_on_evict=false。etcd三节点3.5.33、periodic保留5m、compaction limit=8/sleep=100ms、backend interval=100ms/limit10000、snapshot-count1000、quota24GiB/maxrequest8MiB。
+二进制来源及SHA256见 build-manifest.json，逐节点实际启动命令见 deployment.json；每轮使用新的专用etcd数据与cluster id。
 
 逐分钟统计在 `per-minute.csv`（UTF-8带BOM，逗号分隔），共{len(minutes)}行。窗口以client开始时间为原点，左闭右开；durable按审计确认时间归窗，存在watch传输/采集延迟，并非服务端精确commit时间。数值0表示未观察到事件，缺失的监控字段留空；`samples`、`sample_span_s`和`supply_seconds`用于判断窗口是否完整。发生审计失败时，全部durable统计应视为无效，不能把零当作正常吞吐。
 延迟p95/p99是累积直方图差分的桶上界，不是逐RPC精确分位数；`inf`表示溢出最高有限桶，不能解读为实际无限延迟。CPU以核数计，内存/磁盘以bytes计；入队失败和standby缺失Remove告警按接收计数，可能相对真实操作稍有延迟。
 重复日志只保留每分钟次数和样本，以免测试日志耗尽磁盘。原始每秒数值监控、每batch审计、压缩事件日志、最终prefix和etcd状态均保留供复算。
 
 发现 {len(warnings)} 项需分析的非预期表现，详见 `ISSUES.md`。是否存在Txn长尾：超过100ms计数={summary['txn_over_100ms']}。
+"""
+    if run["workload"] == "put_evict_get":
+        report += f"""
+## Put:Get = 1:2 的读请求
+
+每个worker串行执行一批BatchPutStart/BatchPutEnd，再对同批所有key执行两批BatchGetReplicaList；各批最多128对象。
+比例按逻辑对象请求尝试数，不按RPC次数，也不按durable数计算。Put失败的key仍读取并单列；不再额外每16批采样Get。
+Get只查询元数据，不存储或传输真实payload；每次成功响应核验checksum、replica ID、状态、长度、segment范围和原始地址。
+OBJECT_NOT_FOUND单列为missing，eviction下允许出现；Get不写OpLog，不计入durable吞吐。
+
+| 收尾计数 | 数值 |
+|---|---:|
+| client Put尝试对象 | {done.get('attempted')} |
+| client Get尝试对象 | {done.get('get_attempted')} |
+| Get/Put尝试比 | {summary['get_to_put_attempt_ratio']} |
+| client Get成功 / missing / 其他错误 | {done.get('get_success')} / {done.get('missing')} / {done.get('get_errors')} |
+| 读取失败Put的次数 | {done.get('get_after_failed_put')} |
+| master Get对象 / 失败对象 / BatchGet请求 | {summary['master_get_items']} / {summary['master_get_failed_items']} / {summary['master_get_requests']} |
+| master减client的Get对象差 | {summary['master_client_get_difference']} |
+| client Get结果未对账数 | {summary['get_outcome_difference']} |
+
+master读计数使用供压停止后的完整采样；每分钟文件中的读指标使用相邻采样差分，边界可能略有偏差。
 """
     report += "\n## 每十五分钟吞吐变化\n\n| 分钟 | durable PUT_END/s | durable REMOVE/s | durable 全部entries/s | batch/s | Txn >100ms次数 |\n|---|---:|---:|---:|---:|---:|\n"
     for first in range(0, len(minutes), 15):
